@@ -14,7 +14,7 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PREFIX = '/dsh-paper-dual';
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 const DEFAULT_ENGINE = 'E:\\ruanjianxiazai\\deepseek\\work\\paper-dual-reduce';
 
 // Cordis 要求显式声明要用的服务，否则 apply 里取 ctx.webServer 会报
@@ -593,11 +593,18 @@ function buildHints(diagResult) {
 }
 
 async function reducePlan(body) {
+  const scope = body?.scope === 'both' ? 'both' : 'aigc';
   const run = loadState().lastRun;
   if (!run?.docPath) return { ok: false, error: '先诊断一次' };
   const d = await aigcDiag({ target: 'original' });
   if (!d.ok) return { ok: false, error: `先跑 9 维诊断拿到痕迹清单：${d.error}` };
   const hints = buildHints(d.result);
+  if (scope === 'both') {
+    // 双降不是「两次改写」，而是一次改写同时满足两个目标：
+    // AIGC 侧的痕迹要求 + 重复侧的合并/回指要求，一起写进同一批提示词。
+    hints.push('对篇内重复的片段做合并、回指或概括：同一内容只讲一遍，重复率不得上升');
+    hints.push('合并不改变论点顺序与论据数量；不得为了消重删掉限定词');
+  }
   if (!hints.length) {
     return {
       ok: false,
@@ -606,11 +613,12 @@ async function reducePlan(body) {
     };
   }
   const dir = engineDir();
-  const hintsPath = join(run.outdir, 'aigc-hints.md');
+  const hintsPath = join(run.outdir, scope === 'both' ? 'shuangjiang-hints.md' : 'aigc-hints.md');
   mkdirSync(run.outdir, { recursive: true });
   writeFileSync(hintsPath, `${hints.map((h) => `· ${h}`).join('\n')}\n`, 'utf8');
 
-  const maxTasks = Math.min(Math.max(Number(body?.maxTasks) || 12, 1), 30);
+  const fallbackTasks = scope === 'both' ? 16 : 12;
+  const maxTasks = Math.min(Math.max(Number(body?.maxTasks) || fallbackTasks, 1), 30);
   const r = await runCmd(pythonBin(), [
     'run.py', 'rewrite', '--in', run.docPath, '--outdir', run.outdir,
     '--style', 'plain', '--max-tasks', String(maxTasks), '--hints', hintsPath,
@@ -619,13 +627,17 @@ async function reducePlan(body) {
 
   const tasks = readJson(join(run.outdir, 'tasks.json'));
   const prompts = (readText(join(run.outdir, 'prompts.jsonl')) ?? '').split('\n').filter(Boolean).length;
+  const opCount = {};
+  for (const t of tasks?.tasks ?? []) opCount[t.op] = (opCount[t.op] ?? 0) + 1;
   const payload = {
     at: new Date().toISOString(),
+    scope,
     outdir: run.outdir,
     hints,
     hintsPath,
     tasks: tasks?.tasks?.length ?? 0,
     prompts,
+    opCount,
     promptsPath: join(run.outdir, 'prompts.jsonl'),
     editsPath: join(run.outdir, 'edits.jsonl'),
     diagBefore: {
@@ -634,8 +646,10 @@ async function reducePlan(body) {
       level: d.result.level,
       gate: d.result.style_gate_passed,
     },
+    repeatBefore: run.summary?.repeatRate ?? null,
     instruction: [
-      `请按 ${join(run.outdir, 'prompts.jsonl')} 逐行改写（每条提示词已带 AIGC 痕迹要求），`,
+      `请按 ${join(run.outdir, 'prompts.jsonl')} 逐行改写（每条提示词已带痕迹要求`
+      + `${scope === 'both' ? '与消重要求' : ''}），`,
       `把结果写成 ${join(run.outdir, 'edits.jsonl')}（一行一条 {"pid","text","op"}），`,
       '然后调用工具 paper_dual_apply_edits 完成预检与回填。',
     ].join(''),
@@ -658,6 +672,27 @@ async function reduceCheck() {
   const b = before.result;
   const a = after.result;
 
+  // 重复率复检：对改稿再跑一次引擎诊断，拿 profile 里的篇内重复率
+  let dup = null;
+  try {
+    const chkDir = join(run.outdir, 'check');
+    const rr = await runCmd(pythonBin(), [
+      'run.py', 'diagnose', '--in', join(run.outdir, 'rewritten.docx'), '--outdir', chkDir,
+    ], engineDir(), 180000);
+    if (rr.code === 0) {
+      const prof = readJson(join(chkDir, 'profile.json'));
+      const beforeRate = run.summary?.repeatRate ?? null;
+      const afterRate = prof?.duplicates?.stats?.repeat_rate;
+      if (typeof afterRate === 'number') {
+        dup = {
+          before: beforeRate,
+          after: afterRate,
+          delta: beforeRate == null ? null : Number((beforeRate - afterRate).toFixed(4)),
+        };
+      }
+    }
+  } catch { /* 重复率复检失败不阻塞 AIGC 结论 */ }
+
   let prob = null;
   const sb = await aigcScore({ target: 'original' });
   const sa = await aigcScore({ target: 'rewritten' });
@@ -679,6 +714,7 @@ async function reduceCheck() {
       deltaRisks: b.risk_count - a.risk_count,
       todoAfter: a.todo ?? [],
     },
+    dup,
     prob,
   };
   saveState({ lastReduceCheck: payload });

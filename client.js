@@ -11,7 +11,7 @@ window.__ModuleLoader__.load({
 
     const PANEL_ID = 'dsh-paper-dual';
     const PREFIX = '/dsh-paper-dual';
-    const VERSION = '0.4.0';
+    const VERSION = '0.4.1';
 
     const api = (p) => new URL(String(p).replace(/^\/+/, ''), document.baseURI).pathname;
     const getJson = async (p) => (await fetch(api(p), { cache: 'no-store' })).json();
@@ -429,8 +429,7 @@ window.__ModuleLoader__.load({
     }
 
     function AigcCard({ status, score, diag, delta, aiLabel, target, onTarget, onScore, onDiag,
-      onSelftest, onCalibrate, onDelta, onCopy, copied, busy }) {
-      const dry = status?.detectorReady === false || status?.mode === 'dry-run';
+      onSelftest, onCalibrate, onDelta, onCopy, copied, busy }) {      const dry = status?.detectorReady === false || status?.mode === 'dry-run';
       const r = score?.result;
       const d = diag?.result;
       const prob = r ? Number(r.ai_prob) : null;
@@ -476,8 +475,17 @@ window.__ModuleLoader__.load({
           h(Btn, {
             key: 'cl', onClick: onCalibrate, disabled: busy === 'aigcCalib',
             title: '标定 0/1 哪个代表 AI（真机必做）',
-          }, busy === 'aigcCalib' ? '校准中…' : '校准'),
+          }, busy === 'aigcCalib' ? '校准中…' : '校准'),        ]),
+        h('div', {
+          key: 'what',
+          style: { fontSize: 11, color: C.dim, lineHeight: 1.75, marginBottom: 8 },
+        }, [
+          h('div', { key: '1' },
+            '这页三步：① 给整篇打一个「像不像 AI 写的」概率 → ② 看 9 类 AI 痕迹体检 → ③ 把痕迹要求交给改写。'),
+          h('div', { key: '2' },
+            '读法：概率 0–100%，越高越像 AI；9 维里带黄点的是本轮要改的点；「改写作业清单」就是下一轮改写的具体要求。'),
         ]),
+
         dry ? h('div', {
           key: 'setup',
           style: {
@@ -570,9 +578,9 @@ window.__ModuleLoader__.load({
             },
           }, t === 'original' ? '原文' : '改稿'))),
           h(Btn, { key: 'sc', onClick: onScore, primary: true, disabled: busy === 'aigcScore' },
-            busy === 'aigcScore' ? '打分中…' : '打分'),
+            busy === 'aigcScore' ? '检测中…' : '检测 AIGC 率'),
           h(Btn, { key: 'dg', onClick: onDiag, disabled: busy === 'aigcDiag' },
-            busy === 'aigcDiag' ? '诊断中…' : '9 维诊断'),
+            busy === 'aigcDiag' ? '体检中…' : 'AI 痕迹体检'),
           h(Btn, {
             key: 'dl', onClick: onDelta, disabled: busy === 'aigcDelta',
             title: '对原文和改稿各打一次分，看差了多少',
@@ -667,7 +675,8 @@ window.__ModuleLoader__.load({
     }
 
     // 「降 AIGC」：把 9 维痕迹诊断转成改写要求，跑完回填再用 diag/检测器复检
-    function ReduceCard({ plan, check, busy, onPlan, onCheck }) {
+    function ReduceCard({ mode, plan, check, busy, onPlan, onCheck }) {
+      const isBoth = mode === 'both';
       const d = check?.diag;
       const p = check?.prob;
       const delta = (a, b, unit = '') => {
@@ -681,11 +690,13 @@ window.__ModuleLoader__.load({
         h('div', {
           key: 'h', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 },
         }, [
-          h('span', { key: 't', style: { fontSize: 12, fontWeight: 600 } }, '降 AIGC（痕迹 → 改写 → 复检）'),
-          h('span', { key: 's', style: { fontSize: 11, color: C.dim } }, '把 9 维结论注入提示词再回填'),
+          h('span', { key: 't', style: { fontSize: 12, fontWeight: 600 } },
+            isBoth ? '双降：一次改写同时降重 + 降 AI' : '降 AIGC：痕迹 → 改写 → 复检'),
+          h('span', { key: 's', style: { fontSize: 11, color: C.dim } },
+            isBoth ? '痕迹要求与消重要求写进同一批提示词' : '把 9 维结论注入提示词再回填'),
           h('span', { key: 'sp', style: { flex: 1 } }),
           h(Btn, { key: 'p', onClick: onPlan, primary: true, disabled: busy === 'reducePlan' },
-            busy === 'reducePlan' ? '生成中…' : '生成降 AI 任务'),
+            busy === 'reducePlan' ? '生成中…' : (isBoth ? '生成双降任务' : '生成降 AI 任务')),
           h(Btn, { key: 'c', onClick: onCheck, disabled: busy === 'reduceCheck' },
             busy === 'reduceCheck' ? '复检中…' : '复检痕迹'),
         ]),
@@ -694,12 +705,31 @@ window.__ModuleLoader__.load({
           h('div', { key: 'meta', style: { fontSize: 11, color: C.dim, marginBottom: 4 } },
             `任务 ${plan.tasks} 段 ｜ 提示词 ${plan.prompts} 条 ｜ 要求 ${plan.hints.length} 条`
             + ` ｜ 诊断前：风险 ${plan.diagBefore.riskCount} 项 / 分数 ${plan.diagBefore.riskScore}`),
+          (plan.opCount && Object.keys(plan.opCount).length) ? h('div', {
+            key: 'ops', style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 },
+          }, [
+            h('span', { key: 'l', style: { fontSize: 11, color: C.dim } }, '本批算子'),
+            ...Object.entries(plan.opCount).map(([op, n]) => h('span', {
+              key: op,
+              style: {
+                fontSize: 10.5, padding: '1px 7px', borderRadius: 999,
+                background: C.pill, color: op === 'O9' ? C.low : C.dim,
+              },
+            }, `${op}×${n}`)),
+          ]) : null,
+          plan.scope === 'both' ? h('div', {
+            key: 'bothnote', style: { fontSize: 10.5, color: C.subtle, lineHeight: 1.7, marginBottom: 6 },
+          }, `双降前提：篇内重复率 ${(100 * (plan.repeatBefore ?? 0)).toFixed(1)}%。`
+            + `引擎只在「单段重复占比 ≥ 45%」时才归因为内部重复并派 O9；`
+            + (plan.opCount?.O9
+              ? `本批含 O9×${plan.opCount.O9}，即重复段与 AI 痕迹段一起改。`
+              : '本篇没有这样的段落，所以本批任务由 AIGC 侧驱动（没有可合并的重复段）。')) : null,
           ...plan.hints.slice(0, 8).map((hint, i) => h('div', {
             key: `h${i}`,
             style: { fontSize: 11.5, lineHeight: 1.7, paddingLeft: 11, textIndent: -11, color: C.dim },
           }, `· ${hint}`)),
           h('div', { key: 'next', style: { fontSize: 10.5, color: C.subtle, marginTop: 4 } },
-            '提示词已带这些要求：让模型按 prompts.jsonl 写 edits.jsonl，再点「回填并复检」。'),
+            '下一步：让模型按 prompts.jsonl 写 edits.jsonl → 点「预检」→「回填并复检」→「三栏对照」。'),
         ]) : null,
 
         d ? h('div', {
@@ -722,6 +752,19 @@ window.__ModuleLoader__.load({
             }, `AIGC 概率 ${(100 * p.before).toFixed(1)}% → ${(100 * p.after).toFixed(1)}%`
               + (p.mode === 'model' ? '' : '（dry-run 占位值，不算数）')) : null,
           ]),
+          check.dup ? h('div', {
+            key: 'dup', style: { display: 'flex', gap: 10, flexWrap: 'wrap', color: C.dim, marginTop: 3 },
+          }, [
+            h('span', { key: '1' }, '篇内重复'),
+            h('span', { key: '2' },
+              `${(100 * (check.dup.before ?? 0)).toFixed(1)}% → ${(100 * check.dup.after).toFixed(1)}%`),
+            check.dup.delta != null
+              ? h('span', {
+                key: '3',
+                style: { color: check.dup.delta >= 0 ? C.low : C.high },
+              }, `${check.dup.delta >= 0 ? '↓' : '↑'}${Math.abs(100 * check.dup.delta).toFixed(1)} 个百分点`)
+              : null,
+          ]) : null,
           d.todoAfter?.length ? h('div', {
             key: 'c', style: { marginTop: 4, fontSize: 11, color: C.dim },
           }, `剩余待改：${d.todoAfter.join('；')}`) : null,
@@ -1116,13 +1159,14 @@ window.__ModuleLoader__.load({
       }), [wrapBusy]);
 
       const runReducePlan = useCallback(() => wrapBusy('reducePlan', async () => {
-        const r = await postJson(`${PREFIX}/reduce/plan`, {});
+        const r = await postJson(`${PREFIX}/reduce/plan`, { scope: mode === 'both' ? 'both' : 'aigc' });
         if (!alive.current) return;
         if (!r.ok) { setReducePlanRes(null); setError(r.error); return; }
         setReducePlanRes(r);
-        setMsg(`已生成降 AI 任务：${r.tasks} 段 / ${r.prompts} 条提示词，要求 ${r.hints.length} 条`);
+        const opText = Object.entries(r.opCount ?? {}).map(([k, v]) => `${k}×${v}`).join(' ');
+        setMsg(`已生成${r.scope === 'both' ? '双降' : '降 AI'}任务：${r.tasks} 段 / ${r.prompts} 条提示词 ｜ 算子 ${opText}`);
         refresh();
-      }), [refresh, wrapBusy]);
+      }), [mode, refresh, wrapBusy]);
 
       const runReduceCheck = useCallback(() => wrapBusy('reduceCheck', async () => {
         const r = await postJson(`${PREFIX}/reduce/check`, {});
@@ -1324,6 +1368,7 @@ window.__ModuleLoader__.load({
           // 降 AIGC：痕迹 → 改写 → 回填 → 复检（降重模式不显示）
           mode !== 'dedupe' && h(ReduceCard, {
             key: 'reduce',
+            mode,
             plan: reducePlanRes,
             check: reduceCheckRes,
             busy,
@@ -1331,18 +1376,43 @@ window.__ModuleLoader__.load({
             onCheck: runReduceCheck,
           }),
 
-          // 闭环步骤（降重与双降用；降 AI 模式走卡内的专属按钮）
-          mode !== 'aigc' && h('div', { key: 'steps', style: card }, [
-            h('div', { key: 'h', style: sectionLabel }, '改写闭环（模型只写 edits.jsonl，脚本负责回填与复检）'),
+          // 闭环步骤（三模式共用同一条流水线，只是任务来源不同）
+          h('div', { key: 'steps', style: card }, [
+            h('div', { key: 'h', style: sectionLabel },
+              mode === 'dedupe'
+                ? '改写闭环（模型只写 edits.jsonl，脚本负责回填与复检）'
+                : mode === 'both'
+                  ? '双降闭环：一次改写同时降重 + 降 AI（模型只写 edits.jsonl）'
+                  : '降 AI 闭环：痕迹要求 → 改写 → 回填 → 复检（模型只写 edits.jsonl）'),
             h('div', { key: 'row', style: { display: 'flex', gap: 14, flexWrap: 'wrap', marginBottom: 9 } }, [
-              h(Step, { key: '1', n: 1, title: '生成任务', active: true, done: Boolean(tasks) }),
+              h(Step, {
+                key: '1', n: 1,
+                title: mode === 'dedupe' ? '生成任务' : '生成降 AI 任务',
+                active: true, done: Boolean(tasks) || Boolean(reducePlanRes),
+              }),
               h(Step, { key: '2', n: 2, title: '预检', done: Boolean(lint) }),
               h(Step, { key: '3', n: 3, title: '回填复检', done: Boolean(verdict?.passed) }),
               h(Step, { key: '4', n: 4, title: '三栏对照', done: Boolean(rows?.length) }),
             ]),
+            // 当前进度：回答「到底改过没有」
+            h('div', {
+              key: 'state',
+              style: { display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 11, color: C.dim, marginBottom: 8 },
+            }, [
+              h('span', { key: '1' }, `任务 ${tasks?.tasks?.length ?? reducePlanRes?.tasks ?? '—'} 段`),
+              h('span', { key: '2' }, `提示词 ${tasks?.prompts ?? reducePlanRes?.prompts ?? '—'} 条`),
+              h('span', {
+                key: '3', style: { color: status?.hasEdits ? C.low : C.dim },
+              }, status?.hasEdits ? 'edits.jsonl 已写入' : 'edits.jsonl 未写入'),
+              h('span', {
+                key: '4',
+                style: { color: verdict ? (verdict.passed ? C.low : C.high) : C.dim },
+              }, verdict ? (verdict.passed ? '已回填，复检通过' : '复检未过，已整篇回退') : '尚未回填'),
+            ]),
             h('div', { key: 'btns', style: { display: 'flex', gap: 8, flexWrap: 'wrap' } }, [
-              h(Btn, { key: 't', onClick: runTasks, disabled: busy === 'tasks' },
-                busy === 'tasks' ? '生成中…' : '生成改写任务'),
+              mode === 'dedupe' && h(Btn, {
+                key: 't', onClick: runTasks, disabled: busy === 'tasks',
+              }, busy === 'tasks' ? '生成中…' : '生成改写任务'),
               h(Btn, { key: 'l', onClick: runLintNow, disabled: busy === 'lint' || !status?.hasEdits },
                 busy === 'lint' ? '预检中…' : '预检'),
               h(Btn, {
@@ -1359,8 +1429,7 @@ window.__ModuleLoader__.load({
           ]),
 
           // 预检结果
-          mode !== 'aigc' && lint ? h('div', { key: 'lint', style: card }, [
-            h('div', { key: 'h', style: sectionLabel },
+          lint ? h('div', { key: 'lint', style: card }, [            h('div', { key: 'h', style: sectionLabel },
               `预检：可通过 ${lint.counts?.would_apply ?? 0} ｜ 会被拒 ${lint.counts?.would_reject ?? 0}`),
             ...(lint.rejected ?? []).slice(0, 8).map((it) => h('div', {
               key: `l-${it.pid}`,
@@ -1373,7 +1442,7 @@ window.__ModuleLoader__.load({
           ]) : null,
 
           // 复检结果
-          mode !== 'aigc' && verdict ? h('div', { key: 'verdict', style: card }, [
+          verdict ? h('div', { key: 'verdict', style: card }, [
             h('div', { key: 'h', style: sectionLabel }, '复检结论'),
             h('div', {
               key: 'line',
@@ -1389,7 +1458,7 @@ window.__ModuleLoader__.load({
           ]) : null,
 
           // 三栏对照
-          mode !== 'aigc' && rows?.length ? h('div', { key: 'cmp' }, [
+          rows?.length ? h('div', { key: 'cmp' }, [
             h('div', { key: 'h', style: sectionLabel }, `三栏对照（${rows.length} 段）`),
             ...rows.map((r) => h('div', {
               key: r.pid, style: { ...card, marginBottom: 8 },
@@ -1436,6 +1505,13 @@ window.__ModuleLoader__.load({
                   label: 'AIGC 概率',
                   value: `${(100 * reduceCheckRes.prob.before).toFixed(1)}%→${(100 * reduceCheckRes.prob.after).toFixed(1)}%`,
                   tone: reduceCheckRes.prob.mode === 'model' ? undefined : 'warn',
+                }
+                : null,
+              reduceCheckRes?.dup
+                ? {
+                  label: '重复率',
+                  value: `${(100 * (reduceCheckRes.dup.before ?? 0)).toFixed(1)}%→${(100 * reduceCheckRes.dup.after).toFixed(1)}%`,
+                  tone: (reduceCheckRes.dup.delta ?? 0) >= 0 ? 'ok' : 'bad',
                 }
                 : null,
             ].filter(Boolean),
