@@ -158,8 +158,19 @@ function summarize(doc, profile) {
   };
 }
 
-async function diagnose(docPath) {
+// 路径归一化：面板输入常带结尾空格、成对引号、file:// 前缀，
+// 这些都会让 existsSync 假阴性，报出「找不到文档」但文件其实在。
+function normalizeDocPath(raw) {
+  if (typeof raw !== 'string') return '';
+  let p = raw.trim();
+  p = p.replace(/^file:\/*/i, '');
+  p = p.replace(/^["'“”]+|["'“”]+$/g, '').trim();
+  return p;
+}
+
+async function diagnose(rawPath) {
   const dir = engineDir();
+  const docPath = normalizeDocPath(rawPath);
   if (!existsSync(join(dir, 'run.py'))) {
     return { ok: false, error: `引擎目录里没有 run.py：${dir}（在设置里改成 paper-dual-reduce 的绝对路径）` };
   }
