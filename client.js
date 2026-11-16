@@ -11,7 +11,7 @@ window.__ModuleLoader__.load({
 
     const PANEL_ID = 'dsh-paper-dual';
     const PREFIX = '/dsh-paper-dual';
-    const VERSION = '0.3.1';
+    const VERSION = '0.4.0';
 
     const api = (p) => new URL(String(p).replace(/^\/+/, ''), document.baseURI).pathname;
     const getJson = async (p) => (await fetch(api(p), { cache: 'no-store' })).json();
@@ -734,6 +734,144 @@ window.__ModuleLoader__.load({
       ]);
     }
 
+    // ------------------------------------------------------------ 模式入口
+    const MODES = [
+      {
+        id: 'dedupe', title: '降低篇内重复率', tag: '降重',
+        desc: '只处理「自己抄自己」：13 字指纹找重复片段，合并/回指/概括，不动 AIGC 面。',
+        bullets: ['离线可验：重复率前后对比', '不联网、不装模型', '改完 Word 格式零漂移'],
+      },
+      {
+        id: 'aigc', title: '降低 AIGC 率', tag: '降 AI',
+        desc: '9 维痕迹诊断（模板套话/被动/句长/对称/嵌套/冒号/标点/口语/破折号）→ 写进提示词 → 改写回填。',
+        bullets: ['离线：9 维风险项与分数可验', '真机：检测器给概率前后对比', '语体门禁防改成大白话'],
+      },
+      {
+        id: 'both', title: '双降', tag: '降重 + 降 AI',
+        desc: '按设计顺序执行：先降重（稳定文本结构）→ 再降 AIGC（打磨语体），报告两者都含。',
+        bullets: ['两个目标分开度量', '任一项恶化就回退', '报告含双降对比'],
+      },
+    ];
+
+    function ModeHome({ docPath, onPath, onDiagnose, onHomeInput, busy, lastRun, mode, onMode }) {
+      const ready = Boolean(lastRun);
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } }, [
+        h('div', {
+          key: 'intro', style: { fontSize: 12, color: C.dim, lineHeight: 1.8 },
+        }, [
+          h('div', { key: '1' }, '先填论文路径并诊断，再选一个模式进入对应工作流。'),
+          h('div', { key: '2', style: { fontSize: 11 } },
+            '三个模式共用同一条流水线（生成任务 → 模型写 edits.jsonl → 预检 → 回填 → 复检），只是关注点不同。'),
+        ]),
+        h('div', { key: 'input', style: { display: 'flex', gap: 8, alignItems: 'center' } }, [
+          h('input', {
+            key: 'p', value: docPath, placeholder: '论文 .docx 的绝对路径（只读，不改原文件）',
+            onChange: (e) => onPath(e.target.value),
+            onKeyDown: (e) => { if (e.key === 'Enter') onDiagnose(); },
+            style: {
+              flex: 1, padding: '8px 10px', fontSize: 12, borderRadius: 8,
+              border: `1px solid ${C.border}`, background: 'transparent', color: 'inherit',
+            },
+          }),
+          h(Btn, { key: 'run', onClick: onDiagnose, primary: true, disabled: busy === 'diagnose' },
+            busy === 'diagnose' ? '诊断中…' : '诊断'),
+        ]),
+        lastRun ? h('div', {
+          key: 'ready', style: { fontSize: 11, color: C.low },
+        }, `已诊断：${(lastRun.docPath || '').split(/[\\/]/).pop()}（${lastRun.summary?.stats?.paragraphs ?? '—'} 段）`)
+          : null,
+        h('div', { key: 'cards', style: { display: 'grid', gap: 10 } },
+        MODES.map((m) => h('div', {
+          key: m.id,
+          onClick: () => { if (ready) onMode(m.id); },
+          style: {
+            border: `1px solid ${ready ? C.border : C.pill}`, borderRadius: 10, padding: 12,
+            cursor: ready ? 'pointer' : 'not-allowed', opacity: ready ? 1 : 0.55,
+            background: mode === m.id ? C.pill : C.card,
+          },
+        }, [
+          h('div', {
+            key: 'h', style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 },
+          }, [
+            h('span', { key: 't', style: { fontSize: 13, fontWeight: 600 } }, m.title),
+            h('span', {
+              key: 'g', style: {
+                fontSize: 10, padding: '1px 7px', borderRadius: 999, background: C.pill, color: C.dim,
+              },
+            }, m.tag),
+            h('span', { key: 's', style: { flex: 1 } }),
+            ready ? h('span', { key: 'go', style: { fontSize: 11, color: C.accent } }, '进入 →') : null,
+          ]),
+          h('div', { key: 'd', style: { fontSize: 11.5, color: C.dim, lineHeight: 1.7 } }, m.desc),
+          h('div', { key: 'b', style: { display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 6 } },
+          m.bullets.map((b, i) => h('span', {
+            key: i, style: { fontSize: 10.5, color: C.subtle },
+          }, `· ${b}`))),
+        ]))),
+        !ready ? h('div', {
+          key: 'hint', style: { fontSize: 11, color: C.subtle },
+        }, '还没诊断：填路径后点「诊断」，三个模式会同时解锁。') : null,
+      ]);
+    }
+
+    // 报告页里的「AIGC 复检」摘要（降重模式不需要）
+    function buildAigcReport(mode, check, apply) {
+      if (mode === 'dedupe') return '';
+      const d = check?.diag;
+      const p = check?.prob;
+      const lines = [];
+      if (d) {
+        lines.push(
+          '## AIGC 复检', '',
+          '| 指标 | 改写前 | 改写后 |', '|---|---|---|',
+          `| 风险项 | ${d.before.riskCount} | ${d.after.riskCount} |`,
+          `| 风险分 | ${d.before.riskScore} | ${d.after.riskScore} |`,
+          `| 语体门禁 | ${d.before.gate ? '通过' : '未通过'} | ${d.after.gate ? '通过' : '未通过'} |`,
+        );
+        if (p) {
+          lines.push(`| AIGC 概率 | ${(100 * p.before).toFixed(1)}% | ${(100 * p.after).toFixed(1)}%`
+            + `${p.mode === 'model' ? '' : '（dry-run 占位）'} |`);
+        }
+      }
+      if (apply?.verdict) {
+        lines.push('', `- 改写接受 ${apply.apply?.applied ?? '—'} 段 / 拒绝 ${apply.apply?.rejected ?? '—'} 段`);
+        lines.push(`- 篇级复检：${apply.verdict.passed ? '通过' : '未通过（已整篇回退）'}｜字数 ${apply.verdict.chars[0]}→${apply.verdict.chars[1]}`);
+      }
+      return lines.join('\n');
+    }
+
+    // ------------------------------------------------------------ 报告页
+    function ReportCard({ mode, metrics, report, extraMarkdown, onCopy, copied, onClose }) {
+      const modeTitle = MODES.find((m) => m.id === mode)?.title || '报告';
+      return h('div', {
+        style: { border: `1px solid ${C.border}`, borderRadius: 10, padding: 12, background: C.card },
+      }, [
+        h('div', {
+          key: 'h', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 },
+        }, [
+          h('span', { key: 't', style: { fontSize: 13, fontWeight: 650 } }, `${modeTitle} · 报告`),
+          h('span', { key: 's', style: { flex: 1 } }),
+          h(Btn, { key: 'c', onClick: () => onCopy?.('report', report || '') },
+            copied === 'report' ? '已复制' : '复制 Markdown'),
+          h(Btn, { key: 'x', onClick: onClose }, '收起'),
+        ]),
+        (metrics ?? []).length ? h('div', {
+          key: 'm', style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 },
+        }, (metrics ?? []).map((x) => h('span', {
+          key: x.label,
+          style: {
+            fontSize: 11, padding: '3px 9px', borderRadius: 999, background: C.pill,
+            color: x.tone === 'bad' ? C.high : x.tone === 'warn' ? C.mid : x.tone === 'ok' ? C.low : C.dim,
+          },
+        }, `${x.label} ${x.value}`))) : null,
+        extraMarkdown ? h('div', {
+          key: 'extra', style: { marginBottom: 10, paddingBottom: 10, borderBottom: `1px solid ${C.border}` },
+        }, h(Markdown, { text: extraMarkdown })) : null,
+        h('div', { key: 'body', style: { maxHeight: 440, overflow: 'auto', paddingRight: 4 } },
+          h(Markdown, { text: report || '（报告为空）' })),
+      ]);
+    }
+
     function TopTable({ rows, open, onToggle }) {
       const grid = '58px 96px 52px 1fr 58px';
       const head = { display: 'grid', gridTemplateColumns: grid, gap: 6, padding: '6px 9px' };
@@ -809,6 +947,7 @@ window.__ModuleLoader__.load({
       const [lint, setLint] = useState(null);
       const [apply, setApply] = useState(null);
       const [rows, setRows] = useState(null);
+      const [mode, setMode] = useState(null);
       const [report, setReport] = useState(null);
       const [aigc, setAigc] = useState(null);
       const [aigcTarget, setAigcTarget] = useState('original');
@@ -859,6 +998,8 @@ window.__ModuleLoader__.load({
         try {
           const saved = localStorage.getItem('dsh-paper-dual:doc');
           if (saved) setDocPath((p) => p || saved);
+          const savedMode = localStorage.getItem('dsh-paper-dual:mode');
+          if (savedMode) setMode((m) => m || savedMode);
         } catch { /* ignore */ }
       }, [refresh]);
 
@@ -877,6 +1018,19 @@ window.__ModuleLoader__.load({
         setError('');
         setMsg('');
         try { await fn(); } finally { if (alive.current) setBusy(''); }
+      }, []);
+
+      const enterMode = useCallback((m) => {
+        setMode(m);
+        setError('');
+        setMsg('');
+        try { localStorage.setItem('dsh-paper-dual:mode', m); } catch { /* ignore */ }
+      }, []);
+
+      const exitMode = useCallback(() => {
+        setMode(null);
+        setError('');
+        setMsg('');
       }, []);
 
       const runDiagnose = useCallback(() => wrapBusy('diagnose', async () => {
@@ -1065,20 +1219,35 @@ window.__ModuleLoader__.load({
           ]),
         ]) : null,
 
-        // 输入
-        h('div', { key: 'input', style: { display: 'flex', gap: 8, alignItems: 'center' } }, [
-          h('input', {
-            key: 'p', value: docPath, placeholder: '论文 .docx 的绝对路径（只读，不改原文件）',
-            onChange: (e) => setDocPath(e.target.value),
-            onKeyDown: (e) => { if (e.key === 'Enter') runDiagnose(); },
+        // 入口：未选模式 → 首页三选一；已选模式 → 模式条（返回 + 切模式）
+        mode ? h('div', {
+          key: 'modebar',
+          style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+        }, [
+          h(Btn, { key: 'back', onClick: exitMode, title: '回到模式选择' }, '← 模式'),
+          h('span', { key: 't', style: { fontSize: 12.5, fontWeight: 600 } },
+            MODES.find((m) => m.id === mode)?.title || mode),
+          h('span', { key: 's', style: { flex: 1 } }),
+          ...MODES.map((m) => h('button', {
+            key: m.id, type: 'button', onClick: () => enterMode(m.id),
             style: {
-              flex: 1, padding: '8px 10px', fontSize: 12, borderRadius: 8,
-              border: `1px solid ${C.border}`, background: 'transparent', color: 'inherit',
+              padding: '4px 10px', fontSize: 11, cursor: 'pointer', borderRadius: 7,
+              border: `1px solid ${m.id === mode ? 'transparent' : C.border}`,
+              background: m.id === mode ? C.accent : 'transparent',
+              color: m.id === mode ? '#fff' : C.dim,
             },
-          }),
-          h(Btn, { key: 'run', onClick: runDiagnose, primary: true, disabled: busy === 'diagnose' },
-            busy === 'diagnose' ? '诊断中…' : '诊断'),
-        ]),
+          }, m.tag)),
+        ]) : null,
+        !mode ? h(ModeHome, {
+          key: 'home',
+          docPath,
+          onPath: setDocPath,
+          onDiagnose: runDiagnose,
+          busy,
+          lastRun: result ? { docPath: result.docPath, summary: result.summary } : null,
+          mode,
+          onMode: enterMode,
+        }) : null,
 
         error ? h('div', {
           key: 'err',
@@ -1089,9 +1258,9 @@ window.__ModuleLoader__.load({
         }, error) : null,
         msg ? h('div', { key: 'msg', style: { fontSize: 12, color: C.dim } }, msg) : null,
 
-        s ? h('div', { key: 'result', style: { display: 'flex', flexDirection: 'column', gap: 10 } }, [
+        mode && s ? h('div', { key: 'result', style: { display: 'flex', flexDirection: 'column', gap: 10 } }, [
           // 概览
-          h('div', { key: 'sum', style: card }, [
+          mode !== 'aigc' && h('div', { key: 'sum', style: card }, [
             h('div', {
               key: 'name', style: { fontSize: 13, fontWeight: 600, marginBottom: 2, wordBreak: 'break-all' },
             }, (result.docPath || '').split(/[\\/]/).pop()),
@@ -1115,8 +1284,8 @@ window.__ModuleLoader__.load({
             ]),
           ]),
 
-          // Top 段落
-          top.length ? h('div', { key: 'top' }, [
+          // Top 段落（降 AI 模式看的是 9 维痕迹，不是六维段落表）
+          mode !== 'aigc' && top.length ? h('div', { key: 'top' }, [
             h('div', { key: 'h', style: sectionLabel }, `高风险段落（前 ${top.length}，点开看原文）`),
             h('div', {
               key: 'tbl',
@@ -1132,8 +1301,8 @@ window.__ModuleLoader__.load({
               + '不是百分比，也不是任何平台的检测概率。字数指该段中文字符数。'),
           ]) : null,
 
-          // AIGC 考官（模型检测 + 9 维痕迹）
-          h(AigcCard, {
+          // AIGC 考官（模型检测 + 9 维痕迹；降重模式不显示）
+          mode !== 'dedupe' && h(AigcCard, {
             key: 'aigc',
             status: aigc,
             score: aigcScoreRes,
@@ -1152,8 +1321,8 @@ window.__ModuleLoader__.load({
             busy,
           }),
 
-          // 降 AIGC：痕迹 → 改写 → 回填 → 复检
-          h(ReduceCard, {
+          // 降 AIGC：痕迹 → 改写 → 回填 → 复检（降重模式不显示）
+          mode !== 'dedupe' && h(ReduceCard, {
             key: 'reduce',
             plan: reducePlanRes,
             check: reduceCheckRes,
@@ -1162,8 +1331,8 @@ window.__ModuleLoader__.load({
             onCheck: runReduceCheck,
           }),
 
-          // 闭环步骤
-          h('div', { key: 'steps', style: card }, [
+          // 闭环步骤（降重与双降用；降 AI 模式走卡内的专属按钮）
+          mode !== 'aigc' && h('div', { key: 'steps', style: card }, [
             h('div', { key: 'h', style: sectionLabel }, '改写闭环（模型只写 edits.jsonl，脚本负责回填与复检）'),
             h('div', { key: 'row', style: { display: 'flex', gap: 14, flexWrap: 'wrap', marginBottom: 9 } }, [
               h(Step, { key: '1', n: 1, title: '生成任务', active: true, done: Boolean(tasks) }),
@@ -1190,7 +1359,7 @@ window.__ModuleLoader__.load({
           ]),
 
           // 预检结果
-          lint ? h('div', { key: 'lint', style: card }, [
+          mode !== 'aigc' && lint ? h('div', { key: 'lint', style: card }, [
             h('div', { key: 'h', style: sectionLabel },
               `预检：可通过 ${lint.counts?.would_apply ?? 0} ｜ 会被拒 ${lint.counts?.would_reject ?? 0}`),
             ...(lint.rejected ?? []).slice(0, 8).map((it) => h('div', {
@@ -1204,7 +1373,7 @@ window.__ModuleLoader__.load({
           ]) : null,
 
           // 复检结果
-          verdict ? h('div', { key: 'verdict', style: card }, [
+          mode !== 'aigc' && verdict ? h('div', { key: 'verdict', style: card }, [
             h('div', { key: 'h', style: sectionLabel }, '复检结论'),
             h('div', {
               key: 'line',
@@ -1220,7 +1389,7 @@ window.__ModuleLoader__.load({
           ]) : null,
 
           // 三栏对照
-          rows?.length ? h('div', { key: 'cmp' }, [
+          mode !== 'aigc' && rows?.length ? h('div', { key: 'cmp' }, [
             h('div', { key: 'h', style: sectionLabel }, `三栏对照（${rows.length} 段）`),
             ...rows.map((r) => h('div', {
               key: r.pid, style: { ...card, marginBottom: 8 },
@@ -1241,33 +1410,52 @@ window.__ModuleLoader__.load({
             ])),
           ]) : null,
 
-          report ? h('div', { key: 'report', style: card }, [
-            h('div', {
-              key: 'h',
-              style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' },
-            }, [
-              h('span', { key: 't', style: { fontSize: 12, fontWeight: 600 } }, '完整报告'),
-              h('span', { key: 'f', style: { fontSize: 11, color: C.dim } }, 'report.md'),
-              h('span', { key: 's', style: { flex: 1 } }),
-              h(Btn, { key: 'c', onClick: () => copy('rep', report) },
-                copied === 'rep' ? '已复制' : '复制 Markdown'),
-              h(Btn, { key: 'x', onClick: () => setReport(null) }, '收起'),
-            ]),
-            h('div', {
-              key: 'body', style: { maxHeight: 440, overflow: 'auto', paddingRight: 4 },
-            }, h(Markdown, { text: report })),
-          ]) : null,
+          report ? h(ReportCard, {
+            key: 'report',
+            mode,
+            metrics: [
+              { label: '段落', value: `${stats.paragraphs ?? '—'}` },
+              { label: '可改写', value: `${stats.rewritable ?? '—'}` },
+              { label: '篇内重复', value: `${(100 * (s.repeatRate || 0)).toFixed(1)}%` },
+              apply?.verdict
+                ? {
+                  label: '改写',
+                  value: `${apply.verdict.changed} 段`,
+                  tone: apply.verdict.passed ? 'ok' : 'bad',
+                }
+                : null,
+              reduceCheckRes?.diag
+                ? {
+                  label: 'AIGC 风险',
+                  value: `${reduceCheckRes.diag.before.riskCount}→${reduceCheckRes.diag.after.riskCount}`,
+                  tone: reduceCheckRes.diag.after.riskCount < reduceCheckRes.diag.before.riskCount ? 'ok' : 'warn',
+                }
+                : null,
+              reduceCheckRes?.prob
+                ? {
+                  label: 'AIGC 概率',
+                  value: `${(100 * reduceCheckRes.prob.before).toFixed(1)}%→${(100 * reduceCheckRes.prob.after).toFixed(1)}%`,
+                  tone: reduceCheckRes.prob.mode === 'model' ? undefined : 'warn',
+                }
+                : null,
+            ].filter(Boolean),
+            report,
+            extraMarkdown: buildAigcReport(mode, reduceCheckRes, apply),
+            onCopy: copy,
+            copied,
+            onClose: () => setReport(null),
+          }) : null,
 
           h('div', { key: 'foot', style: { display: 'flex', gap: 8 } }, [
             h(Btn, { key: 'f', onClick: refresh }, '刷新状态'),
           ]),
-        ]) : h('div', {
+        ]) : mode ? h('div', {
           key: 'empty', style: { fontSize: 12, color: C.dim, lineHeight: 1.85 },
         }, [
-          h('div', { key: '1' }, '填一条 .docx 的绝对路径，点「诊断」。只读原文件，不会改它。'),
+          h('div', { key: '1' }, '这个模式还没有诊断结果：回「← 模式」重新填路径并点「诊断」。'),
           h('div', { key: '2' },
-            '输出是篇内相对风险分（同篇内排序），不是任何平台的检测概率；本工具不承诺通过率。'),
-        ]),
+            '输出是篇内相对风险分（同篇内排序）与 9 维痕迹，不是任何平台的检测概率；本工具不承诺通过率。'),
+        ]) : null,
       ]);
     }
 
@@ -1293,7 +1481,10 @@ window.__ModuleLoader__.load({
 
     // 无浏览器环境下的渲染回归钩子（tools/render.mjs 用）
     if (typeof window !== 'undefined' && window.__PDR_TEST__) {
-      plugin.__test = { parseBlocks, renderInline, Markdown, shortPath, TopTable, AigcCard };
+      plugin.__test = {
+        parseBlocks, renderInline, Markdown, shortPath, TopTable, AigcCard,
+        ModeHome, ReportCard, Panel, MODES, buildAigcReport,
+      };
     }
 
     return plugin;

@@ -75,6 +75,15 @@ function collectText(node, acc = []) {
   if (typeof node === 'string' || typeof node === 'number') { acc.push(String(node)); return acc; }
   if (Array.isArray(node)) { node.forEach((n) => collectText(n, acc)); return acc; }
   if (typeof node !== 'object') return acc;
+  // 函数组件：真 React 会调用它，这里也必须调用，否则拿不到 Markdown/卡片里的文本
+  if (typeof node.type === 'function') {
+    try {
+      collectText(node.type({ ...(node.props || {}), children: node.children }), acc);
+    } catch {
+      acc.push('[[render-error]]');
+    }
+    return acc;
+  }
   (node.children ?? []).forEach((n) => collectText(n, acc));
   if (node.props?.children) collectText(node.props.children, acc);
   return acc;
@@ -125,6 +134,37 @@ const aigcText = collectText(AigcCard({
 for (const need of ['AIGC 考官', 'dry-run 伪概率', '46.4%', '模板套话', '语体门禁 通过', '删除/改写句首模板']) {
   if (!aigcText.includes(need)) failures.push(`AIGC 卡缺少：${need}`);
 }
+
+// 首页三选一与报告页：结构必须能渲染出来
+const { ModeHome, ReportCard, Panel, MODES } = mod.__test ?? {};
+if (!ModeHome || !ReportCard || !Panel || !MODES) throw new Error('入口组件未导出');
+
+const homeText = collectText(ModeHome({
+  docPath: '', onPath: () => {}, onDiagnose: () => {}, busy: '', lastRun: null,
+  mode: null, onMode: () => {},
+})).join(' ');
+for (const need of ['降低篇内重复率', '降低 AIGC 率', '双降', '诊断']) {
+  if (!homeText.includes(need)) failures.push(`首页缺少模式入口：${need}`);
+}
+
+const reportText = collectText(ReportCard({
+  mode: 'both',
+  metrics: [
+    { label: '篇内重复', value: '24.1%' },
+    { label: 'AIGC 风险', value: '2→1', tone: 'ok' },
+    { label: 'AIGC 概率', value: '49.7%→48.6%', tone: 'warn' },
+  ],
+  report: '## 一、文档概览\n\n| 指标 | 数值 |\n|---|---|\n| 段落总数 | 862 |\n',
+  extraMarkdown: '## AIGC 复检\n\n| 指标 | 改写前 | 改写后 |\n|---|---|---|\n| 风险项 | 2 | 1 |\n',
+  onCopy: () => {}, copied: '', onClose: () => {},
+})).join(' ');
+for (const need of ['报告', '篇内重复 24.1%', 'AIGC 风险 2→1', 'AIGC 复检', '段落总数']) {
+  if (!reportText.includes(need)) failures.push(`报告页缺少：${need}`);
+}
+
+// 整块 Panel 直接渲染一次（首页态），确认没有结构性错误
+const panelText = collectText(Panel()).join(' ');
+if (!panelText.includes('论文双降')) failures.push('Panel 首页渲染异常');
 
 // 管道符不应以纯文本行出现（表格分隔行漏渲染是最常见的坏味道）
 const leaks = blocks.filter((b) => b.t === 'p' && /^\|.*\|$/.test(b.text));
