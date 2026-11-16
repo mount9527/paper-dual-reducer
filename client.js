@@ -11,7 +11,7 @@ window.__ModuleLoader__.load({
 
     const PANEL_ID = 'dsh-paper-dual';
     const PREFIX = '/dsh-paper-dual';
-    const VERSION = '0.3.0';
+    const VERSION = '0.3.1';
 
     const api = (p) => new URL(String(p).replace(/^\/+/, ''), document.baseURI).pathname;
     const getJson = async (p) => (await fetch(api(p), { cache: 'no-store' })).json();
@@ -481,12 +481,26 @@ window.__ModuleLoader__.load({
         dry ? h('div', {
           key: 'setup',
           style: {
-            border: `1px dashed ${C.border}`, borderRadius: 8, padding: 9,
+            border: `1px dashed ${C.border}`, borderRadius: 8, padding: 10,
             marginBottom: 8, background: C.code,
           },
         }, [
-          h('div', { key: 'h', style: { fontSize: 11.5, color: C.mid, marginBottom: 6 } },
-            '要拿真分数，三步（缺一步都还是 dry-run）：'),
+          h('div', { key: 'why-h', style: { fontSize: 11.5, color: C.mid, fontWeight: 600, marginBottom: 4 } },
+            '为什么是 dry-run'),
+          h('div', { key: 'why', style: { fontSize: 11, color: C.dim, lineHeight: 1.7, marginBottom: 6 } },
+            `插件在下面这个 python 里没找到 transformers + torch，加载不了模型，`
+            + `于是用「文本哈希 → 确定性伪随机数」占位：同一段文本每次得到同一个数，但那个数和文本质量无关。`),
+
+          h('div', { key: 'bad-h', style: { fontSize: 11.5, color: C.high, fontWeight: 600, marginBottom: 4 } },
+            '它的缺点（所以别拿它当结论）'),
+          h('div', { key: 'bad', style: { fontSize: 11, color: C.dim, lineHeight: 1.75, marginBottom: 6 } }, [
+            h('div', { key: '1' }, '· 数值没有意义：改写前后那点差值（如 49.7% → 48.6%）是随机差，不是真实降幅'),
+            h('div', { key: '2' }, '· 不能验收：无法判断某次改写到底有没有降低 AIGC 概率'),
+            h('div', { key: '3' }, '· 唯一真实的是 9 维诊断：diag.py 是纯正则，不依赖模型，任何机器都能用'),
+          ]),
+
+          h('div', { key: 'steps-h', style: { fontSize: 11.5, color: C.dim, fontWeight: 600, marginBottom: 4 } },
+            '切到真机：三步，约 1.2GB 磁盘'),
           h('div', {
             key: 's1', style: { display: 'flex', gap: 6, alignItems: 'flex-start', marginBottom: 6 },
           }, [
@@ -499,34 +513,45 @@ window.__ModuleLoader__.load({
               }, setup?.step1Install || 'pip install -r aigc/requirements.txt'),
             ]),
             h(Btn, {
-              key: 'cp',
-              onClick: () => onCopy?.('install', setup?.step1Install || ''),
+              key: 'cp', onClick: () => onCopy?.('install', setup?.step1Install || ''),
             }, copied === 'install' ? '已复制' : '复制'),
           ]),
-          h('div', {
-            key: 's2', style: { display: 'flex', gap: 6, fontSize: 11, color: C.dim, marginBottom: 4 },
-          }, [
-            h('span', { key: 'n', style: { paddingTop: 1 } }, '2'),
-            h('span', { key: 't', style: { flex: 1 } },
-              setup?.step2Model || '首次运行会下载约 818MB 权重'),
+          h('div', { key: 's2', style: { display: 'flex', gap: 6, marginBottom: 6 } }, [
+            h('span', { key: 'n', style: { fontSize: 11, color: C.dim, paddingTop: 1 } }, '2'),
+            h('div', { key: 't', style: { flex: 1, minWidth: 0, fontSize: 11, color: C.dim, lineHeight: 1.7 } }, [
+              h('div', { key: 'a' }, '下模型权重（首次打分时自动下载；也可先手动下好）'),
+              h('div', { key: 'u', style: { wordBreak: 'break-all' } },
+                '下载页：https://huggingface.co/yuchuantian/AIGC_detector_zhv3'),
+              h('div', { key: 'p', style: { wordBreak: 'break-all' } },
+                `落盘目录（默认缓存）：${status?.setup?.modelCacheDir || 'C:\\Users\\<你>\\.cache\\huggingface\\hub\\models--yuchuantian--AIGC_detector_zhv3'}`),
+              h('div', { key: 'm' },
+                '国内镜像：先执行 set HF_ENDPOINT=https://hf-mirror.com 再跑第 3 步'),
+              h('div', { key: 's' }, '体积：约 818MB（pytorch_model.bin + vocab.txt + config/tokenizer）'),
+            ]),
+            h(Btn, {
+              key: 'cp2',
+              onClick: () => onCopy?.('modelurl', 'https://huggingface.co/yuchuantian/AIGC_detector_zhv3'),
+            }, copied === 'modelurl' ? '已复制' : '复制链接'),
           ]),
-          h('div', {
-            key: 's3', style: { display: 'flex', gap: 6, fontSize: 11, color: C.dim, marginBottom: 4 },
-          }, [
-            h('span', { key: 'n', style: { paddingTop: 1 } }, '3'),
-            h('div', { key: 't', style: { flex: 1 } }, [
-              h('div', { key: 'a' }, '跑一次标签标定（0/1 谁是 AI 不确定，不标定会读反）'),
+          h('div', { key: 's3', style: { display: 'flex', gap: 6, marginBottom: 4 } }, [
+            h('span', { key: 'n', style: { fontSize: 11, color: C.dim, paddingTop: 1 } }, '3'),
+            h('div', { key: 't', style: { flex: 1, minWidth: 0 } }, [
+              h('div', { key: 'a', style: { fontSize: 11, color: C.dim } },
+                '校准标签方向（该模型 config 缺 id2label，0/1 谁是 AI 未知；不校准会读反且不报错）'),
               h('code', {
                 key: 'c', style: { fontSize: 10.5, display: 'block', wordBreak: 'break-all', marginTop: 2 },
               }, setup?.step3Calibrate || ''),
             ]),
+            h(Btn, {
+              key: 'cp3', onClick: () => onCopy?.('calib', setup?.step3Calibrate || ''),
+            }, copied === 'calib' ? '已复制' : '复制'),
           ]),
           h('div', {
-            key: 'py', style: { fontSize: 10.5, color: C.dim, marginTop: 4, wordBreak: 'break-all' },
+            key: 'py', style: { fontSize: 10.5, color: C.dim, marginTop: 6, wordBreak: 'break-all' },
           }, `当前解释器：${status?.python || pythonBinFallback}`),
           h('div', {
             key: 'tip', style: { fontSize: 10.5, color: C.subtle, marginTop: 2 },
-          }, '装完仍是 dry-run？多半是装到了别的 venv：在「设置」里把解释器路径改成那个 python.exe。'),
+          }, '装完仍是 dry-run？多半是装到了别的 venv：在「设置」里把解释器路径改成那个 python.exe，然后点「校准」。'),
         ]) : null,
 
         h('div', {
@@ -641,6 +666,74 @@ window.__ModuleLoader__.load({
       ]);
     }
 
+    // 「降 AIGC」：把 9 维痕迹诊断转成改写要求，跑完回填再用 diag/检测器复检
+    function ReduceCard({ plan, check, busy, onPlan, onCheck }) {
+      const d = check?.diag;
+      const p = check?.prob;
+      const delta = (a, b, unit = '') => {
+        const v = a - b;
+        const color = v > 0 ? C.low : v < 0 ? C.high : C.dim;
+        return h('span', { style: { color } }, `${v > 0 ? '↓' : v < 0 ? '↑' : '='}${Math.abs(v)}${unit}`);
+      };
+      return h('div', {
+        style: { border: `1px solid ${C.border}`, borderRadius: 10, padding: 11, background: C.card },
+      }, [
+        h('div', {
+          key: 'h', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 },
+        }, [
+          h('span', { key: 't', style: { fontSize: 12, fontWeight: 600 } }, '降 AIGC（痕迹 → 改写 → 复检）'),
+          h('span', { key: 's', style: { fontSize: 11, color: C.dim } }, '把 9 维结论注入提示词再回填'),
+          h('span', { key: 'sp', style: { flex: 1 } }),
+          h(Btn, { key: 'p', onClick: onPlan, primary: true, disabled: busy === 'reducePlan' },
+            busy === 'reducePlan' ? '生成中…' : '生成降 AI 任务'),
+          h(Btn, { key: 'c', onClick: onCheck, disabled: busy === 'reduceCheck' },
+            busy === 'reduceCheck' ? '复检中…' : '复检痕迹'),
+        ]),
+
+        plan ? h('div', { key: 'plan', style: { marginBottom: 8 } }, [
+          h('div', { key: 'meta', style: { fontSize: 11, color: C.dim, marginBottom: 4 } },
+            `任务 ${plan.tasks} 段 ｜ 提示词 ${plan.prompts} 条 ｜ 要求 ${plan.hints.length} 条`
+            + ` ｜ 诊断前：风险 ${plan.diagBefore.riskCount} 项 / 分数 ${plan.diagBefore.riskScore}`),
+          ...plan.hints.slice(0, 8).map((hint, i) => h('div', {
+            key: `h${i}`,
+            style: { fontSize: 11.5, lineHeight: 1.7, paddingLeft: 11, textIndent: -11, color: C.dim },
+          }, `· ${hint}`)),
+          h('div', { key: 'next', style: { fontSize: 10.5, color: C.subtle, marginTop: 4 } },
+            '提示词已带这些要求：让模型按 prompts.jsonl 写 edits.jsonl，再点「回填并复检」。'),
+        ]) : null,
+
+        d ? h('div', {
+          key: 'check',
+          style: { borderTop: `1px solid ${C.border}`, paddingTop: 7, fontSize: 11.5 },
+        }, [
+          h('div', { key: 'a', style: { display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 3 } }, [
+            h('span', { key: '1', style: { color: C.dim } }, '风险项'),
+            h('span', { key: '2' }, `${d.before.riskCount} → ${d.after.riskCount}`),
+            delta(d.before.riskCount, d.after.riskCount, ' 项'),
+            h('span', { key: '3', style: { color: C.dim, marginLeft: 8 } }, '风险分'),
+            h('span', { key: '4' }, `${d.before.riskScore} → ${d.after.riskScore}`),
+            delta(d.before.riskScore, d.after.riskScore, ''),
+          ]),
+          h('div', { key: 'b', style: { display: 'flex', gap: 10, flexWrap: 'wrap', color: C.dim } }, [
+            h('span', { key: '1' }, `语体门禁 ${d.before.gate ? '过' : '未过'} → ${d.after.gate ? '过' : '未过'}`),
+            p ? h('span', {
+              key: '2',
+              style: { color: p.mode === 'model' ? 'inherit' : C.mid },
+            }, `AIGC 概率 ${(100 * p.before).toFixed(1)}% → ${(100 * p.after).toFixed(1)}%`
+              + (p.mode === 'model' ? '' : '（dry-run 占位值，不算数）')) : null,
+          ]),
+          d.todoAfter?.length ? h('div', {
+            key: 'c', style: { marginTop: 4, fontSize: 11, color: C.dim },
+          }, `剩余待改：${d.todoAfter.join('；')}`) : null,
+        ]) : null,
+
+        !plan && !d ? h('div', {
+          key: 'empty', style: { fontSize: 11, color: C.dim, lineHeight: 1.7 },
+        }, '点「生成降 AI 任务」：插件先跑 9 维诊断（离线可用），把结论写成改写要求注入每条提示词，'
+          + '模型改完回填后，再点「复检痕迹」看风险项与分数是否下降。') : null,
+      ]);
+    }
+
     function TopTable({ rows, open, onToggle }) {
       const grid = '58px 96px 52px 1fr 58px';
       const head = { display: 'grid', gridTemplateColumns: grid, gap: 6, padding: '6px 9px' };
@@ -722,6 +815,8 @@ window.__ModuleLoader__.load({
       const [aigcScoreRes, setAigcScoreRes] = useState(null);
       const [aigcDiagRes, setAigcDiagRes] = useState(null);
       const [aigcDeltaRes, setAigcDeltaRes] = useState(null);
+      const [reducePlanRes, setReducePlanRes] = useState(null);
+      const [reduceCheckRes, setReduceCheckRes] = useState(null);
       const [error, setError] = useState('');
       const [msg, setMsg] = useState('');
       const [copied, setCopied] = useState('');
@@ -864,6 +959,24 @@ window.__ModuleLoader__.load({
         if (!r.ok) { setError(r.error); return; }
         setAigcDeltaRes(r);
         setMsg(`前后对比：${(100 * r.before).toFixed(1)}% → ${(100 * r.after).toFixed(1)}%`);
+      }), [wrapBusy]);
+
+      const runReducePlan = useCallback(() => wrapBusy('reducePlan', async () => {
+        const r = await postJson(`${PREFIX}/reduce/plan`, {});
+        if (!alive.current) return;
+        if (!r.ok) { setReducePlanRes(null); setError(r.error); return; }
+        setReducePlanRes(r);
+        setMsg(`已生成降 AI 任务：${r.tasks} 段 / ${r.prompts} 条提示词，要求 ${r.hints.length} 条`);
+        refresh();
+      }), [refresh, wrapBusy]);
+
+      const runReduceCheck = useCallback(() => wrapBusy('reduceCheck', async () => {
+        const r = await postJson(`${PREFIX}/reduce/check`, {});
+        if (!alive.current) return;
+        if (!r.ok) { setError(r.error); return; }
+        setReduceCheckRes(r);
+        setMsg(`复检：风险 ${r.diag.before.riskCount}→${r.diag.after.riskCount} ｜ `
+          + `分数 ${r.diag.before.riskScore}→${r.diag.after.riskScore}`);
       }), [wrapBusy]);
 
       const loadCompare = useCallback(() => wrapBusy('cmp', async () => {
@@ -1037,6 +1150,16 @@ window.__ModuleLoader__.load({
             onCopy: copy,
             copied,
             busy,
+          }),
+
+          // 降 AIGC：痕迹 → 改写 → 回填 → 复检
+          h(ReduceCard, {
+            key: 'reduce',
+            plan: reducePlanRes,
+            check: reduceCheckRes,
+            busy,
+            onPlan: runReducePlan,
+            onCheck: runReduceCheck,
           }),
 
           // 闭环步骤

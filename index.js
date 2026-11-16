@@ -14,7 +14,7 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PREFIX = '/dsh-paper-dual';
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 const DEFAULT_ENGINE = 'E:\\ruanjianxiazai\\deepseek\\work\\paper-dual-reduce';
 
 // Cordis 要求显式声明要用的服务，否则 apply 里取 ctx.webServer 会报
@@ -403,6 +403,16 @@ async function resolveAigcText(body) {
   return t.ok ? { ...t, target } : t;
 }
 
+// HuggingFace 默认缓存目录（Windows 也在 ~/.cache/huggingface/hub）。
+// 用户可能用 HF_HOME / HF_HUB_CACHE 改过，这里按同样优先级显示。
+function hfCacheDir() {
+  const hub = process.env.HF_HUB_CACHE;
+  if (hub) return join(hub, 'models--yuchuantian--AIGC_detector_zhv3');
+  const home = process.env.HF_HOME;
+  if (home) return join(home, 'hub', 'models--yuchuantian--AIGC_detector_zhv3');
+  return join(homedir(), '.cache', 'huggingface', 'hub', 'models--yuchuantian--AIGC_detector_zhv3');
+}
+
 async function aigcStatus() {
   const ready = await detectorReady();
   const py = await pythonExecutable();
@@ -422,7 +432,9 @@ async function aigcStatus() {
     // 拿到「真分数」需要三步，缺一步都不算数
     setup: {
       step1Install: `"${pythonBin()}" -m pip install -r "${req}"`,
-      step2Model: '首次运行会从 HuggingFace 下载约 818MB 权重；国内可先设 HF_ENDPOINT=https://hf-mirror.com',
+      modelHint: '首次运行会从 HuggingFace 下载约 818MB 权重；国内可先设 HF_ENDPOINT=https://hf-mirror.com',
+      modelUrl: 'https://huggingface.co/yuchuantian/AIGC_detector_zhv3',
+      modelCacheDir: hfCacheDir(),
       step3Calibrate: `"${pythonBin()}" "${det}" --calibrate`,
       whyCalibrate: '该模型 config.json 缺 id2label，0/1 哪个是 AI 未知；不标定会得到反着读的分数且不报错',
       pythonNote: '装依赖必须装进上面那个解释器，装到别的 venv 里插件仍然显示 dry-run',
@@ -559,6 +571,120 @@ async function aigcSelftest() {
   };
 }
 
+// ---------------------------------------------------------------- 降 AIGC 闭环
+// 思路：把 9 维痕迹诊断的结论翻译成「改写要求」，注入引擎的每条提示词，
+// 再走既有的 预检→回填→复检 管线；改完用 diag 复检（离线可用）与检测器（需模型）各验一次。
+
+function buildHints(diagResult) {
+  const d = diagResult ?? {};
+  const out = [];
+  const push = (s) => { if (s && !out.includes(s)) out.push(s); };
+  for (const t of d.todo ?? []) push(t);
+  if (d.template?.risk) push('删掉「随着…」「在…方面」「综上所述」这类套话框架，改成具体主语的陈述');
+  if (d.passive?.risk) push('把被动句改成主动句，补出施事者');
+  if (d.burstiness?.level === 'low') push('打破句长均齐：短句与长句交替，避免连续三句长度接近');
+  if (d.symmetry?.risk) push('打破段落对称：相邻段落句数不要雷同');
+  if (d.nested?.risk) push('拆开层层嵌套的从句，一句只说一件事');
+  if (d.colon?.risk) push('减少冒号并列与编号罗列，改成叙述式表达');
+  if (d.punct?.risk) push('标点节奏：不要用句号把句子切成碎片，也不要一句超过 60 字');
+  if (d.dash?.gate_failed) push('减少破折号，每段最多 1 个');
+  if (d.colloquial?.gate_failed) push('删除口语词，保持书面语（语体门禁会把口语词判为不合格）');
+  return out;
+}
+
+async function reducePlan(body) {
+  const run = loadState().lastRun;
+  if (!run?.docPath) return { ok: false, error: '先诊断一次' };
+  const d = await aigcDiag({ target: 'original' });
+  if (!d.ok) return { ok: false, error: `先跑 9 维诊断拿到痕迹清单：${d.error}` };
+  const hints = buildHints(d.result);
+  if (!hints.length) {
+    return {
+      ok: false,
+      error: '9 维诊断没有发现明显 AI 痕迹，这篇不需要「降 AI」改写',
+      diag: { riskCount: d.result.risk_count, riskScore: d.result.risk_score },
+    };
+  }
+  const dir = engineDir();
+  const hintsPath = join(run.outdir, 'aigc-hints.md');
+  mkdirSync(run.outdir, { recursive: true });
+  writeFileSync(hintsPath, `${hints.map((h) => `· ${h}`).join('\n')}\n`, 'utf8');
+
+  const maxTasks = Math.min(Math.max(Number(body?.maxTasks) || 12, 1), 30);
+  const r = await runCmd(pythonBin(), [
+    'run.py', 'rewrite', '--in', run.docPath, '--outdir', run.outdir,
+    '--style', 'plain', '--max-tasks', String(maxTasks), '--hints', hintsPath,
+  ], dir, 240000);
+  if (r.code !== 0) return { ok: false, error: clip(r.err || r.out, 700) };
+
+  const tasks = readJson(join(run.outdir, 'tasks.json'));
+  const prompts = (readText(join(run.outdir, 'prompts.jsonl')) ?? '').split('\n').filter(Boolean).length;
+  const payload = {
+    at: new Date().toISOString(),
+    outdir: run.outdir,
+    hints,
+    hintsPath,
+    tasks: tasks?.tasks?.length ?? 0,
+    prompts,
+    promptsPath: join(run.outdir, 'prompts.jsonl'),
+    editsPath: join(run.outdir, 'edits.jsonl'),
+    diagBefore: {
+      riskCount: d.result.risk_count,
+      riskScore: d.result.risk_score,
+      level: d.result.level,
+      gate: d.result.style_gate_passed,
+    },
+    instruction: [
+      `请按 ${join(run.outdir, 'prompts.jsonl')} 逐行改写（每条提示词已带 AIGC 痕迹要求），`,
+      `把结果写成 ${join(run.outdir, 'edits.jsonl')}（一行一条 {"pid","text","op"}），`,
+      '然后调用工具 paper_dual_apply_edits 完成预检与回填。',
+    ].join(''),
+    stdout: clip(r.out, 300),
+  };
+  saveState({ lastReduce: payload });
+  return { ok: true, ...payload };
+}
+
+async function reduceCheck() {
+  const run = loadState().lastRun;
+  if (!run?.docPath) return { ok: false, error: '先诊断一次' };
+  if (!existsSync(join(run.outdir, 'rewritten.docx'))) {
+    return { ok: false, error: '还没有改稿：先回填一次' };
+  }
+  const before = await aigcDiag({ target: 'original' });
+  if (!before.ok) return before;
+  const after = await aigcDiag({ target: 'rewritten' });
+  if (!after.ok) return after;
+  const b = before.result;
+  const a = after.result;
+
+  let prob = null;
+  const sb = await aigcScore({ target: 'original' });
+  const sa = await aigcScore({ target: 'rewritten' });
+  if (sb.ok && sa.ok) {
+    prob = {
+      mode: sb.mode,
+      before: sb.result.ai_prob,
+      after: sa.result.ai_prob,
+      delta: Number((sb.result.ai_prob - sa.result.ai_prob).toFixed(4)),
+    };
+  }
+
+  const payload = {
+    at: new Date().toISOString(),
+    diag: {
+      before: { riskCount: b.risk_count, riskScore: b.risk_score, level: b.level, gate: b.style_gate_passed },
+      after: { riskCount: a.risk_count, riskScore: a.risk_score, level: a.level, gate: a.style_gate_passed },
+      deltaScore: b.risk_score - a.risk_score,
+      deltaRisks: b.risk_count - a.risk_count,
+      todoAfter: a.todo ?? [],
+    },
+    prob,
+  };
+  saveState({ lastReduceCheck: payload });
+  return { ok: true, ...payload };
+}
+
 // ---------------------------------------------------------------- 状态与路由
 
 function status() {
@@ -625,6 +751,13 @@ const handler = async (req, res) => {
     }
     if (path === '/aigc/delta' && req.method === 'POST') {
       return sendJson(res, 200, await aigcDelta());
+    }
+    if (path === '/reduce/plan' && req.method === 'POST') {
+      const body = await readBody(req);
+      return sendJson(res, 200, await reducePlan(body));
+    }
+    if (path === '/reduce/check' && req.method === 'POST') {
+      return sendJson(res, 200, await reduceCheck());
     }
     if (path === '/compare') {
       const rows = buildCompare();
