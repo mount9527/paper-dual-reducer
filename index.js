@@ -14,7 +14,7 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PREFIX = '/dsh-paper-dual';
-const VERSION = '0.4.5';
+const VERSION = '0.4.6';
 const DEFAULT_ENGINE = 'E:\\ruanjianxiazai\\deepseek\\work\\paper-dual-reduce';
 
 // Cordis 要求显式声明要用的服务，否则 apply 里取 ctx.webServer 会报
@@ -773,11 +773,25 @@ async function reduceCheck() {
     };
   }
 
+  // 对称串口径：origin=最初诊断，before=上一轮复检的值（本批基线），after=当前改稿。
+  // 只报 origin→after 会让人以为每批都在拆同几条，所以两个差值都算出来。
+  const originRuns = await pacingRuns(join(run.outdir, 'doc.json'));
+  const afterRuns = await pacingRuns(join(stateDir(), 'aigc-tmp', 'doc.json'));
+  const prevState = loadState();
+  const baselineRuns = Number.isInteger(prevState.pacingBaseline)
+    ? prevState.pacingBaseline
+    : originRuns;
+  const origin = Number.isInteger(prevState.pacingOrigin) ? prevState.pacingOrigin : originRuns;
+  if (Number.isInteger(afterRuns)) saveState({ pacingBaseline: afterRuns, pacingOrigin: origin });
+
   const payload = {
     at: new Date().toISOString(),
     pacing: {
-      before: await pacingRuns(join(run.outdir, 'doc.json')),
-      after: await pacingRuns(join(stateDir(), 'aigc-tmp', 'doc.json')),
+      origin,
+      before: baselineRuns,
+      after: afterRuns,
+      deltaBatch: (baselineRuns != null && afterRuns != null) ? baselineRuns - afterRuns : null,
+      deltaTotal: (origin != null && afterRuns != null) ? origin - afterRuns : null,
     },
     diag: {
       before: {
