@@ -11,7 +11,7 @@ window.__ModuleLoader__.load({
 
     const PANEL_ID = 'dsh-paper-dual';
     const PREFIX = '/dsh-paper-dual';
-    const VERSION = '0.4.3';
+    const VERSION = '0.4.4';
 
     const api = (p) => new URL(String(p).replace(/^\/+/, ''), document.baseURI).pathname;
     const getJson = async (p) => (await fetch(api(p), { cache: 'no-store' })).json();

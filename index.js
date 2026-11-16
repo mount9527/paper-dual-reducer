@@ -14,7 +14,7 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PREFIX = '/dsh-paper-dual';
-const VERSION = '0.4.3';
+const VERSION = '0.4.4';
 const DEFAULT_ENGINE = 'E:\\ruanjianxiazai\\deepseek\\work\\paper-dual-reduce';
 
 // Cordis 要求显式声明要用的服务，否则 apply 里取 ctx.webServer 会报
@@ -661,6 +661,10 @@ async function reducePlan(body) {
         runs: (pj?.runs ?? []).length,
         targets: Object.keys(pj?.targets ?? {}).length,
       };
+      // 跨段编排的目标段落也要进任务：只给目标不改段，对称 run 永远不会减少。
+      for (const pid of Object.keys(pj?.targets ?? {})) {
+        if (!includePids.includes(pid)) includePids.push(pid);
+      }
     }
   } catch { pacingPath = null; }
 
