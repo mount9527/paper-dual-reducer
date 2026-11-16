@@ -14,7 +14,7 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PREFIX = '/dsh-paper-dual';
-const VERSION = '0.4.4';
+const VERSION = '0.4.5';
 const DEFAULT_ENGINE = 'E:\\ruanjianxiazai\\deepseek\\work\\paper-dual-reduce';
 
 // Cordis 要求显式声明要用的服务，否则 apply 里取 ctx.webServer 会报
@@ -713,6 +713,20 @@ async function reducePlan(body) {
   return { ok: true, ...payload };
 }
 
+// 用 pacing 的口径数「对称串」：连续 ≥3 段句数相差 ≤1 的串。
+// 复检时前后各数一次，就能回答「这批改写到底拆掉了几条串」。
+async function pacingRuns(docPath) {
+  try {
+    const out = join(stateDir(), `pacing-runs-${Date.now()}.json`);
+    const r = await runCmd(pythonBin(), [
+      join(engineDir(), 'scripts', 'pacing.py'), '--doc', docPath, '--out', out,
+    ], engineDir(), 120000);
+    if (r.code !== 0) return null;
+    const pj = readJson(out);
+    return (pj?.runs ?? []).length;
+  } catch { return null; }
+}
+
 async function reduceCheck() {
   const run = loadState().lastRun;
   if (!run?.docPath) return { ok: false, error: '先诊断一次' };
@@ -761,6 +775,10 @@ async function reduceCheck() {
 
   const payload = {
     at: new Date().toISOString(),
+    pacing: {
+      before: await pacingRuns(join(run.outdir, 'doc.json')),
+      after: await pacingRuns(join(stateDir(), 'aigc-tmp', 'doc.json')),
+    },
     diag: {
       before: {
         riskCount: b.risk_count, riskScore: b.risk_score, level: b.level,

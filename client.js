@@ -11,7 +11,7 @@ window.__ModuleLoader__.load({
 
     const PANEL_ID = 'dsh-paper-dual';
     const PREFIX = '/dsh-paper-dual';
-    const VERSION = '0.4.4';
+    const VERSION = '0.4.5';
 
     const api = (p) => new URL(String(p).replace(/^\/+/, ''), document.baseURI).pathname;
     const getJson = async (p) => (await fetch(api(p), { cache: 'no-store' })).json();
@@ -779,8 +779,19 @@ window.__ModuleLoader__.load({
             }, `AIGC 概率 ${(100 * p.before).toFixed(1)}% → ${(100 * p.after).toFixed(1)}%`
               + (p.mode === 'model' ? '' : '（dry-run 占位值，不算数）')) : null,
           ]),
-          check.dup ? h('div', {
-            key: 'dup', style: { display: 'flex', gap: 10, flexWrap: 'wrap', color: C.dim, marginTop: 3 },
+          (check.pacing && check.pacing.before != null && check.pacing.after != null) ? h('div', {
+            key: 'pac', style: { display: 'flex', gap: 10, flexWrap: 'wrap', color: C.dim, marginTop: 3 },
+          }, [
+            h('span', { key: '1' }, '对称串'),
+            h('span', { key: '2' }, `${check.pacing.before} → ${check.pacing.after}`),
+            h('span', {
+              key: '3',
+              style: { color: check.pacing.before > check.pacing.after ? C.low : C.dim },
+            }, check.pacing.before > check.pacing.after
+              ? `↓${check.pacing.before - check.pacing.after} 条被拆掉`
+              : '本条批未拆到串'),
+          ]) : null,
+          check.dup ? h('div', {            key: 'dup', style: { display: 'flex', gap: 10, flexWrap: 'wrap', color: C.dim, marginTop: 3 },
           }, [
             h('span', { key: '1' }, '篇内重复'),
             h('span', { key: '2' },
