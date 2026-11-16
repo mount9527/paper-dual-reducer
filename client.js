@@ -845,7 +845,7 @@ window.__ModuleLoader__.load({
         }, [
           h('div', { key: '1' }, '先填论文路径并诊断，再选一个模式进入对应工作流。'),
           h('div', { key: '2', style: { fontSize: 11 } },
-            '三个模式共用同一条流水线（生成任务 → 模型写 edits.jsonl → 预检 → 回填 → 复检），只是关注点不同。'),
+            '把 .docx 直接拖进这个面板也行；也可以点下面输入框右侧的「诊断」用路径。'),
         ]),
         h('div', { key: 'input', style: { display: 'flex', gap: 8, alignItems: 'center' } }, [
           h('input', {
@@ -1117,6 +1117,25 @@ window.__ModuleLoader__.load({
         setMsg('');
       }, []);
 
+      const [dragOver, setDragOver] = useState(false);
+
+      // 拖拽：Electron 的 File 对象带 .path，可直接拿到绝对路径
+      const onDrop = useCallback((e) => {
+        e.preventDefault();
+        setDragOver(false);
+        const f = e.dataTransfer?.files?.[0];
+        if (!f) return;
+        const p = f.path || f.name;
+        if (!/\.docx$/i.test(p)) {
+          setError('只支持 .docx（.doc 请先在 Word 里另存为 .docx）');
+          return;
+        }
+        setError('');
+        setDocPath(p);
+        setMsg(`已接收：${String(p).split(/[\\/]/).pop()}（路径已填入，点「诊断」开始）`);
+        try { localStorage.setItem('dsh-paper-dual:doc', p); } catch { /* ignore */ }
+      }, []);
+
       const runDiagnose = useCallback(() => wrapBusy('diagnose', async () => {
         const p = String(docPath || '').trim();
         if (!p) { setError('先填论文 .docx 的绝对路径'); return; }
@@ -1258,7 +1277,14 @@ window.__ModuleLoader__.load({
       const card = { border: `1px solid ${C.border}`, borderRadius: 10, padding: 11, background: C.card };
       const sectionLabel = { fontSize: 11.5, color: C.dim, marginBottom: 6 };
 
-      return h('div', { style: wrap }, [
+      return h('div', {
+        style: dragOver
+          ? { ...wrap, outline: `2px dashed ${C.accent}`, outlineOffset: -6, borderRadius: 10 }
+          : wrap,
+        onDragOver: (e) => { e.preventDefault(); if (!dragOver) setDragOver(true); },
+        onDragLeave: () => setDragOver(false),
+        onDrop,
+      }, [
         // 顶栏
         h('div', {
           key: 'head', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
