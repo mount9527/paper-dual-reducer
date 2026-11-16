@@ -11,7 +11,7 @@ window.__ModuleLoader__.load({
 
     const PANEL_ID = 'dsh-paper-dual';
     const PREFIX = '/dsh-paper-dual';
-    const VERSION = '0.4.2';
+    const VERSION = '0.4.3';
 
     const api = (p) => new URL(String(p).replace(/^\/+/, ''), document.baseURI).pathname;
     const getJson = async (p) => (await fetch(api(p), { cache: 'no-store' })).json();
@@ -742,6 +742,10 @@ window.__ModuleLoader__.load({
               },
             }, `${f.pid} ${f.tags.join('/')}`)),
           ]) : null,
+          plan.pacing && plan.pacing.targets ? h('div', {
+            key: 'pacing',
+            style: { fontSize: 10.5, color: C.subtle, marginBottom: 6 },
+          }, `跨段编排：${plan.pacing.runs} 条对称段串 → ${plan.pacing.targets} 段拿到不同目标句数（破「结构对称」）`) : null,
           ...plan.hints.slice(0, 8).map((hint, i) => h('div', {
             key: `h${i}`,
             style: { fontSize: 11.5, lineHeight: 1.7, paddingLeft: 11, textIndent: -11, color: C.dim },

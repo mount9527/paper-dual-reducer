@@ -14,7 +14,7 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PREFIX = '/dsh-paper-dual';
-const VERSION = '0.4.2';
+const VERSION = '0.4.3';
 const DEFAULT_ENGINE = 'E:\\ruanjianxiazai\\deepseek\\work\\paper-dual-reduce';
 
 // Cordis 要求显式声明要用的服务，否则 apply 里取 ctx.webServer 会报
@@ -646,11 +646,30 @@ async function reducePlan(body) {
   } catch { /* 没有 segdiag 时就退回纯风险选段 */ }
   const includePids = focus.map((x) => x.pid);
 
+  // 跨段编排：结构对称是跨段属性，给相邻段分配不同目标句数
+  let pacingPath = null;
+  let pacingInfo = null;
+  try {
+    const pp = join(run.outdir, 'pacing.json');
+    const pc = await runCmd(pythonBin(), [
+      join(dir, 'scripts', 'pacing.py'), '--doc', join(run.outdir, 'doc.json'), '--out', pp,
+    ], dir, 120000);
+    if (pc.code === 0) {
+      const pj = readJson(pp);
+      pacingPath = pp;
+      pacingInfo = {
+        runs: (pj?.runs ?? []).length,
+        targets: Object.keys(pj?.targets ?? {}).length,
+      };
+    }
+  } catch { pacingPath = null; }
+
   const planArgs = [
     'run.py', 'rewrite', '--in', run.docPath, '--outdir', run.outdir,
     '--style', 'plain', '--max-tasks', String(maxTasks), '--hints', hintsPath,
   ];
   if (includePids.length) planArgs.push('--include', includePids.join(','));
+  if (pacingPath) planArgs.push('--pacing', pacingPath);
   const r = await runCmd(pythonBin(), planArgs, dir, 240000);
   if (r.code !== 0) return { ok: false, error: clip(r.err || r.out, 700) };
 
@@ -668,6 +687,7 @@ async function reducePlan(body) {
     prompts,
     opCount,
     focus,
+    pacing: pacingInfo,
     promptsPath: join(run.outdir, 'prompts.jsonl'),
     editsPath: join(run.outdir, 'edits.jsonl'),
     diagBefore: {
