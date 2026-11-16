@@ -1,0 +1,5 @@
+transformers>=4.40
+torch>=2.1
+# 可选：ONNX 量化路线
+# onnxruntime>=1.17
+# optimum[onnxruntime]>=1.17

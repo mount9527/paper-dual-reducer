@@ -1,0 +1,41 @@
+{
+  "name": "dsh-paper-dual",
+  "version": "0.3.0",
+  "description": "论文双降工作台：诊断中文论文 .docx 的 AI 文风与篇内重复，AIGC 考官打分 + 9 维痕迹诊断，闭环改写与三栏对照。",
+  "type": "module",
+  "license": "MIT",
+  "author": "mount9527",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "icon": "icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "aigc/detector.py",
+    "aigc/diag.py",
+    "aigc/selftest.py",
+    "aigc/SPEC.md",
+    "aigc/requirements.txt",
+    "aigc/samples/*.txt",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  }
+}

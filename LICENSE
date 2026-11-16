@@ -1,0 +1,35 @@
+MIT License
+
+Copyright (c) 2026 mount9527
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+第三方组件说明 / Third-party notice
+
+本仓库的 AIGC 检测功能调用公开展示的开源模型
+`yuchuantian/AIGC_detector_zhv3`（HuggingFace，license: Apache-2.0），
+其基座为 `chinese-roberta-wwm-ext`（Apache-2.0）。
+
+本仓库**不包含也不分发**该模型权重：权重由使用者在首次运行时从 HuggingFace
+自行下载，本仓库只保存模型 id 字符串。权重使用须遵守其 Apache-2.0 许可。
+
+`aigc/detector.py`、`aigc/diag.py`、`aigc/selftest.py` 为项目内部交接的实现代码，
+随本仓库以 MIT 发布。

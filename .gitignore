@@ -1,0 +1,19 @@
+# 依赖与任务机产物（插件本身零运行时依赖，这里防的是误提交）
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+
+# 运行产物
+out/
+*.log
+
+# AIGC 模型权重：本插件不打包权重，运行时由用户从 HuggingFace 下载
+aigc/*.bin
+aigc/*.safetensors
+aigc/models/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
