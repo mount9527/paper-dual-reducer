@@ -3,6 +3,10 @@ node_modules/
 pnpm-lock.yaml
 package-lock.json
 
+# Python 缓存（aigc/*.py 跑一次就会生成）
+__pycache__/
+*.py[cod]
+
 # 运行产物
 out/
 *.log
