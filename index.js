@@ -903,7 +903,8 @@ const handler = async (req, res) => {
     if (path === '/upload' && req.method === 'POST') {
       const body = await readBody(req);
       const rawName = String(body?.name || 'upload.docx');
-      const name = basename(rawName).replace(/[^\w.\-\u4e00-\u9fa5]/g, '_') || 'upload.docx';
+      // 只替换 Windows 非法字符，保留中文与空格；否则「测试文档.docx」会变成「____.docx」
+      const name = (basename(rawName).replace(/[\\/:*?"<>|]/g, '_').slice(0, 80)) || 'upload.docx';
       const b64 = String(body?.dataBase64 || '');
       if (!b64) return sendJson(res, 400, { ok: false, error: '没有文件内容' });
       if (b64.length > 48 * 1024 * 1024) {
