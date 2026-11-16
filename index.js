@@ -14,7 +14,7 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PREFIX = '/dsh-paper-dual';
-const VERSION = '0.4.1';
+const VERSION = '0.4.2';
 const DEFAULT_ENGINE = 'E:\\ruanjianxiazai\\deepseek\\work\\paper-dual-reduce';
 
 // Cordis 要求显式声明要用的服务，否则 apply 里取 ctx.webServer 会报
@@ -363,15 +363,12 @@ async function detectorReady() {
   return detReadyCache;
 }
 
-function textFromDocJson(p) {
+function docTexts(p) {
   const doc = readJson(p);
   if (!doc) return null;
-  // 考官按「空行」切段（两个脚本都是 re.split(r"\n\s*\n")），所以这里必须用空行连接，
-  // 否则整篇会变成一个巨型段落，段级门禁（破折号超限等）全部失真。
-  return (doc.paragraphs ?? [])
-    .map((x) => String(x.text ?? '').trim())
-    .filter(Boolean)
-    .join('\n\n');
+  const ps = doc.paragraphs ?? [];
+  const join = (rows) => rows.map((x) => String(x.text ?? '').trim()).filter(Boolean).join('\n\n');
+  return { all: join(ps), rewritable: join(ps.filter((x) => !x.locked)) };
 }
 
 async function textFor(target) {
@@ -386,13 +383,13 @@ async function textFor(target) {
     const r = await runCmd(pythonBin(),
       ['scripts/inspect_docx.py', '--in', docx, '--out', out], engineDir(), 120000);
     if (r.code !== 0) return { ok: false, error: clip(r.err || r.out, 400) };
-    const text = textFromDocJson(out);
-    if (text == null) return { ok: false, error: '改稿解析失败' };
-    return { ok: true, text };
+    const texts = docTexts(out);
+    if (!texts) return { ok: false, error: '改稿解析失败' };
+    return { ok: true, text: texts.all, rewritable: texts.rewritable };
   }
-  const text = textFromDocJson(join(run.outdir, 'doc.json'));
-  if (text == null) return { ok: false, error: '缺 doc.json：重新诊断一次' };
-  return { ok: true, text };
+  const texts = docTexts(join(run.outdir, 'doc.json'));
+  if (!texts) return { ok: false, error: '缺 doc.json：重新诊断一次' };
+  return { ok: true, text: texts.all, rewritable: texts.rewritable };
 }
 
 async function resolveAigcText(body) {
@@ -493,12 +490,26 @@ async function aigcDiag(body) {
   writeFileSync(file, t.text, 'utf8');
   const out = await runAigcJson(['diag.py', '--file', file, '--json'], 120000);
   if (!out.ok) return { ok: false, error: out.error };
+
+  // 双口径门禁：锁定段（标题/表格/参考文献/代码块）永远不改写，
+  // 若把它们算进语体门禁，就会出现一个「永远改不掉的红灯」。
+  // 所以：全文口径只作提示，验收看「只算可改写段」的口径。
+  let gateRewritable = out.json.style_gate_passed;
+  const rwText = typeof t.rewritable === 'string' ? t.rewritable : '';
+  if (rwText && rwText !== t.text) {
+    const rwFile = join(stateDir(), `aigc-${t.target}-rw.txt`);
+    writeFileSync(rwFile, rwText, 'utf8');
+    const rw = await runAigcJson(['diag.py', '--file', rwFile, '--json'], 120000);
+    if (rw.ok) gateRewritable = rw.json.style_gate_passed;
+  }
   return {
     ok: true,
     at: new Date().toISOString(),
     target: t.target,
     result: out.json,
-    // 退出码 1 = 语体门禁未过，是正常语义，不是失败
+    gateAll: out.json.style_gate_passed,
+    gateRewritable,
+    hasRewritableView: Boolean(rwText && rwText !== t.text),
     gateExit: out.code !== 0,
   };
 }
@@ -619,10 +630,28 @@ async function reducePlan(body) {
 
   const fallbackTasks = scope === 'both' ? 16 : 12;
   const maxTasks = Math.min(Math.max(Number(body?.maxTasks) || fallbackTasks, 1), 30);
-  const r = await runCmd(pythonBin(), [
+
+  // 逐段定位痕迹：只改「整篇统计过关」的段落是改不到指标的，
+  // 必须把带具体痕迹的段落强制纳入本轮（plan.py --include）。
+  let focus = [];
+  try {
+    const segPath = join(run.outdir, 'segdiag.json');
+    const sg = await runCmd(pythonBin(), [
+      join(AIGC_DIR, 'segdiag.py'), '--doc', join(run.outdir, 'doc.json'), '--out', segPath,
+    ], AIGC_DIR, 120000);
+    if (sg.code === 0) {
+      const seg = readJson(segPath);
+      focus = (seg?.paragraphs ?? []).slice(0, 8);
+    }
+  } catch { /* 没有 segdiag 时就退回纯风险选段 */ }
+  const includePids = focus.map((x) => x.pid);
+
+  const planArgs = [
     'run.py', 'rewrite', '--in', run.docPath, '--outdir', run.outdir,
     '--style', 'plain', '--max-tasks', String(maxTasks), '--hints', hintsPath,
-  ], dir, 240000);
+  ];
+  if (includePids.length) planArgs.push('--include', includePids.join(','));
+  const r = await runCmd(pythonBin(), planArgs, dir, 240000);
   if (r.code !== 0) return { ok: false, error: clip(r.err || r.out, 700) };
 
   const tasks = readJson(join(run.outdir, 'tasks.json'));
@@ -638,6 +667,7 @@ async function reducePlan(body) {
     tasks: tasks?.tasks?.length ?? 0,
     prompts,
     opCount,
+    focus,
     promptsPath: join(run.outdir, 'prompts.jsonl'),
     editsPath: join(run.outdir, 'edits.jsonl'),
     diagBefore: {
@@ -708,8 +738,14 @@ async function reduceCheck() {
   const payload = {
     at: new Date().toISOString(),
     diag: {
-      before: { riskCount: b.risk_count, riskScore: b.risk_score, level: b.level, gate: b.style_gate_passed },
-      after: { riskCount: a.risk_count, riskScore: a.risk_score, level: a.level, gate: a.style_gate_passed },
+      before: {
+        riskCount: b.risk_count, riskScore: b.risk_score, level: b.level,
+        gate: before.gateRewritable, gateAll: before.gateAll,
+      },
+      after: {
+        riskCount: a.risk_count, riskScore: a.risk_score, level: a.level,
+        gate: after.gateRewritable, gateAll: after.gateAll,
+      },
       deltaScore: b.risk_score - a.risk_score,
       deltaRisks: b.risk_count - a.risk_count,
       todoAfter: a.todo ?? [],

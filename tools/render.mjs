@@ -131,7 +131,7 @@ const aigcText = collectText(AigcCard({
   target: 'original', onTarget: () => {}, onScore: () => {}, onDiag: () => {}, onSelftest: () => {},
   busy: '',
 })).join(' ');
-for (const need of ['AIGC 考官', 'dry-run 伪概率', '46.4%', '模板套话', '语体门禁 通过', '删除/改写句首模板']) {
+for (const need of ['AIGC 考官', 'dry-run 伪概率', '46.4%', '模板套话', '语体门禁（可改写段） 通过', '删除/改写句首模板']) {
   if (!aigcText.includes(need)) failures.push(`AIGC 卡缺少：${need}`);
 }
 

@@ -11,7 +11,7 @@ window.__ModuleLoader__.load({
 
     const PANEL_ID = 'dsh-paper-dual';
     const PREFIX = '/dsh-paper-dual';
-    const VERSION = '0.4.1';
+    const VERSION = '0.4.2';
 
     const api = (p) => new URL(String(p).replace(/^\/+/, ''), document.baseURI).pathname;
     const getJson = async (p) => (await fetch(api(p), { cache: 'no-store' })).json();
@@ -643,9 +643,12 @@ window.__ModuleLoader__.load({
             }, `等级 ${d.level}`),
             h('span', {
               key: 'g',
-              style: { fontSize: 11, padding: '2px 8px', borderRadius: 999, background: C.pill,
-                color: d.style_gate_passed ? C.low : C.high },
-            }, d.style_gate_passed ? '语体门禁 通过' : '语体门禁 未通过'),
+              title: `全文口径：${diag?.gateAll ? '通过' : '未通过'}（含锁定段；锁定段永不改写）`,
+              style: {
+                fontSize: 11, padding: '2px 8px', borderRadius: 999, background: C.pill,
+                color: (diag?.gateRewritable ?? d.style_gate_passed) ? C.low : C.high,
+              },
+            }, `语体门禁（可改写段） ${(diag?.gateRewritable ?? d.style_gate_passed) ? '通过' : '未通过'}`),
           ]),
           h('div', {
             key: 'grid',
@@ -724,6 +727,21 @@ window.__ModuleLoader__.load({
             + (plan.opCount?.O9
               ? `本批含 O9×${plan.opCount.O9}，即重复段与 AI 痕迹段一起改。`
               : '本篇没有这样的段落，所以本批任务由 AIGC 侧驱动（没有可合并的重复段）。')) : null,
+          (plan.focus ?? []).length ? h('div', {
+            key: 'focus',
+            style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 },
+          }, [
+            h('span', { key: 'l', style: { fontSize: 11, color: C.dim } }, '定向纳入'),
+            ...plan.focus.map((f) => h('span', {
+              key: f.pid,
+              title: `命中：${f.tags.join(' / ')}`,
+              style: {
+                fontSize: 10.5, padding: '1px 7px', borderRadius: 999,
+                background: C.pill, color: f.tags.includes('colloquial') || f.tags.includes('dash')
+                  ? C.mid : C.dim,
+              },
+            }, `${f.pid} ${f.tags.join('/')}`)),
+          ]) : null,
           ...plan.hints.slice(0, 8).map((hint, i) => h('div', {
             key: `h${i}`,
             style: { fontSize: 11.5, lineHeight: 1.7, paddingLeft: 11, textIndent: -11, color: C.dim },
@@ -745,7 +763,12 @@ window.__ModuleLoader__.load({
             delta(d.before.riskScore, d.after.riskScore, ''),
           ]),
           h('div', { key: 'b', style: { display: 'flex', gap: 10, flexWrap: 'wrap', color: C.dim } }, [
-            h('span', { key: '1' }, `语体门禁 ${d.before.gate ? '过' : '未过'} → ${d.after.gate ? '过' : '未过'}`),
+            h('span', { key: '1' },
+              `语体门禁（可改写段） ${d.before.gate ? '过' : '未过'} → ${d.after.gate ? '过' : '未过'}`),
+            d.before.gateAll !== undefined
+              ? h('span', { key: '1b', style: { opacity: 0.75 } },
+                `｜ 全文 ${d.before.gateAll ? '过' : '未过'} → ${d.after.gateAll ? '过' : '未过'}`)
+              : null,
             p ? h('span', {
               key: '2',
               style: { color: p.mode === 'model' ? 'inherit' : C.mid },

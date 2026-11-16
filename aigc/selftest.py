@@ -158,6 +158,19 @@ def test_diag_colloquial_gate():
 
 
 @case
+def test_diag_colloquial_no_substring_false_positive():
+    # 「无语料授权」不等于口语词「无语」。子串匹配会把整篇门禁误判为未通过，
+    # 而这类段落往往还是锁定段（永不改写），形成一个永远改不掉的红灯。
+    txt = "本研究不做全库查重，原因是无语料授权，且爬取会违反服务条款。"
+    r = G.diagnose(txt)
+    assert r.colloquial["count"] == 0, f"误判为口语词: {r.colloquial['terms']}"
+    assert r.colloquial["gate_failed"] is False, "无语料 不应触发言语门禁"
+    # 真口语仍然必须抓
+    r2 = G.diagnose("这个结果说实话挺离谱的，我们一开始完全没跑偏，后来才搞定。")
+    assert r2.colloquial["gate_failed"] is True, "真口语词必须仍然触发门禁"
+
+
+@case
 def test_diag_dash_gate():
     bad = "这个方法——经过三轮测试——最终收敛，效果——超出预期。\n\n另一段——也有问题。"
     r = G.diagnose(bad)

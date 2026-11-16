@@ -174,10 +174,29 @@ def punctuation(text: str) -> dict:
     return {"commas_per_sentence": round(per, 2), "risk": per > LIMITS["commas_per_sentence"]}
 
 
+# 「无语」是「无语料/无语言/无语义」的前缀，纯子串匹配会把学术表述误判成口语，
+# 而且这些句子往往在锁定段里（永不改写），会变成一个改不掉的门禁红灯。
+COLLOQUIAL_EXCLUDE = {"无语": ("料", "言", "义", "境", "音", "种")}
+
+
+def _count_colloquial(text: str, term: str) -> int:
+    bad = COLLOQUIAL_EXCLUDE.get(term, ())
+    n = 0
+    i = 0
+    while True:
+        i = text.find(term, i)
+        if i < 0:
+            return n
+        nxt = text[i + len(term): i + len(term) + 1]
+        if nxt not in bad:
+            n += 1
+        i += len(term)
+
+
 def colloquial(text: str) -> dict:
     hits: List[str] = []
     for t in COLLOQUIAL_TERMS:
-        hits.extend([t] * text.count(t))
+        hits.extend([t] * _count_colloquial(text, t))
     return {"count": len(hits), "terms": sorted(set(hits)), "gate_failed": bool(hits)}
 
 
