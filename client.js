@@ -1125,15 +1125,31 @@ window.__ModuleLoader__.load({
         setDragOver(false);
         const f = e.dataTransfer?.files?.[0];
         if (!f) return;
-        const p = f.path || f.name;
-        if (!/\.docx$/i.test(p)) {
+        if (!/\.docx$/i.test(f.name)) {
           setError('只支持 .docx（.doc 请先在 Word 里另存为 .docx）');
           return;
         }
-        setError('');
-        setDocPath(p);
-        setMsg(`已接收：${String(p).split(/[\\/]/).pop()}（路径已填入，点「诊断」开始）`);
-        try { localStorage.setItem('dsh-paper-dual:doc', p); } catch { /* ignore */ }
+        const p = f.path;
+        if (p && /[\\/]/.test(p)) {
+          setError('');
+          setDocPath(p);
+          setMsg(`已接收：${f.name}（路径已填入，点「诊断」开始）`);
+          try { localStorage.setItem('dsh-paper-dual:doc', p); } catch { /* ignore */ }
+          return;
+        }
+        // 新版 Electron 不再给 File.path：把内容送到宿主落盘，换回真实路径
+        const reader = new FileReader();
+        reader.onload = async () => {
+          const b64 = String(reader.result || '').split(',')[1] || '';
+          if (!b64) { setError('读取文件失败'); return; }
+          const r = await postJson(`${PREFIX}/upload`, { name: f.name, dataBase64: b64 });
+          if (!r.ok) { setError(`接收文件失败：${r.error}`); return; }
+          setError('');
+          setDocPath(r.path);
+          setMsg(`已接收：${f.name} → ${r.path}（点「诊断」开始）`);
+          try { localStorage.setItem('dsh-paper-dual:doc', r.path); } catch { /* ignore */ }
+        };
+        reader.readAsDataURL(f);
       }, []);
 
       const runDiagnose = useCallback(() => wrapBusy('diagnose', async () => {

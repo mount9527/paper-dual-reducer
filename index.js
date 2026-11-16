@@ -898,6 +898,24 @@ const handler = async (req, res) => {
     if (path === '/reduce/check' && req.method === 'POST') {
       return sendJson(res, 200, await reduceCheck());
     }
+    // 拖拽兜底：新版 Electron 不再暴露 File.path，只有文件名。
+    // 前端把文件内容 base64 送来，这里落盘到 state 目录，返回真实绝对路径。
+    if (path === '/upload' && req.method === 'POST') {
+      const body = await readBody(req);
+      const rawName = String(body?.name || 'upload.docx');
+      const name = basename(rawName).replace(/[^\w.\-\u4e00-\u9fa5]/g, '_') || 'upload.docx';
+      const b64 = String(body?.dataBase64 || '');
+      if (!b64) return sendJson(res, 400, { ok: false, error: '没有文件内容' });
+      if (b64.length > 48 * 1024 * 1024) {
+        return sendJson(res, 413, { ok: false, error: '文件太大（超过 36MB）' });
+      }
+      const buf = Buffer.from(b64, 'base64');
+      const dir = join(stateDir(), 'uploads');
+      mkdirSync(dir, { recursive: true });
+      const out = join(dir, `${Date.now()}-${name}`);
+      writeFileSync(out, buf);
+      return sendJson(res, 200, { ok: true, path: out, size: buf.length });
+    }
     if (path === '/compare') {
       const rows = buildCompare();
       return sendJson(res, 200, { ok: true, rows, count: rows.length });
