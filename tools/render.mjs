@@ -27,8 +27,14 @@ const mod = captured.factory((name) => {
   if (name === 'react') return MINI;
   throw new Error(`意外的 require：${name}`);
 });
-const { parseBlocks, renderInline, Markdown, TopTable, AigcCard } = mod.__test ?? {};
-if (!parseBlocks || !renderInline || !Markdown || !TopTable || !AigcCard) throw new Error('测试钩子缺失');
+const {
+  parseBlocks, renderInline, Markdown, TopTable, AigcCard, VersionBar, parseEditsText,
+  canStageEditsFor,
+} = mod.__test ?? {};
+if (!parseBlocks || !renderInline || !Markdown || !TopTable || !AigcCard || !VersionBar
+  || !parseEditsText || !canStageEditsFor) {
+  throw new Error('测试钩子缺失');
+}
 
 const reportPath = process.argv[2]
   || process.env.PAPER_DUAL_REPORT
@@ -110,32 +116,50 @@ if (tableText.includes('%')) failures.push('风险分被误标成了百分比');
 // AIGC 考官卡：模式徽标、概率、9 维、作业清单都必须出现
 const aigcText = collectText(AigcCard({
   status: { detectorReady: true, mode: 'model', note: '真机' },
-  score: {
-    mode: 'model',
-    result: {
-      ai_prob: 0.464, chars: 310,
-      segments: [{ index: 0, chars: 103, ai_prob: 0.5072, preview: '随着数字化转型的不断深入' }],
+  scores: {
+    original: {
+      mode: 'model',
+      result: {
+        ai_prob: 0.464, mean_prob: 0.464, ai_share: 0.464, ai_share_hard: 0.2,
+        median_prob: 0.5072, band: 'risk', stability: 0.033, calibrated: false,
+        coverage: 0.97, chars: 310, body_chars: 260, table_chars: 40,
+        reference_chars: 10, all_ai_share: 0.52, table_ai_share: 0.9,
+        reference_ai_share: 0.6, comparison_mode: 'frozen',
+        group_stats: {
+          rewritable: { chars: 260 },
+          table: { chars: 40 },
+          reference: { chars: 10 },
+        },
+        segments: [{
+          index: 0, chars: 103, ai_prob: 0.5072, contribution: 1,
+          kind: 'body', group: 'rewritable', pid_span: [0, 1],
+          preview: '随着数字化转型的不断深入',
+        }],
+      },
     },
   },
-  diag: {
-    result: {
-      risk_count: 1, level: 'mid', style_gate_passed: true,
-      template: { count: 7, per_1000_chars: 22.58, risk: true },
-      passive: { count: 0, per_sentence: 0, risk: false },
-      burstiness: { cv: 0.403, level: 'low', risk: false },
-      symmetry: { runs: [], risk: false },
-      nested: { count: 0, risk: false },
-      colon: { count: 0, risk: false },
-      punct: { commas_per_sentence: 1.5, risk: false },
-      colloquial: { count: 0, gate_failed: false },
-      dash: { total: 0, gate_failed: false },
-      todo: ['删除/改写句首模板与套话（模板句 7 处）'],
+  diags: {
+    original: {
+      result: {
+        risk_count: 1, level: 'mid', style_gate_passed: true,
+        template: { count: 7, per_1000_chars: 22.58, risk: true },
+        passive: { count: 0, per_sentence: 0, risk: false },
+        burstiness: { cv: 0.403, level: 'low', risk: false },
+        symmetry: { runs: [], risk: false },
+        nested: { count: 0, risk: false },
+        colon: { count: 0, risk: false },
+        punct: { commas_per_sentence: 1.5, risk: false },
+        colloquial: { count: 0, gate_failed: false },
+        dash: { total: 0, gate_failed: false },
+        todo: ['删除/改写句首模板与套话（模板句 7 处）'],
+      },
     },
   },
-  target: 'original', onTarget: () => {}, onScore: () => {}, onDiag: () => {}, onSelftest: () => {},
+  target: 'original', canRewrite: false,
+  onTarget: () => {}, onScore: () => {}, onDiag: () => {}, onSelftest: () => {},
   busy: '',
 })).join(' ');
-for (const need of ['AIGC 考官', '真机', '46.4%', '模板套话', '语体门禁（可改写段） 通过', '删除/改写句首模板']) {
+for (const need of ['AIGC 考官', '真机', '正文 AI 疑似占比', '46.4%', 'AI 特征显著', '未校准', '冻结块比较', '表格 90.0%', '参考文献 60.0%', '切分稳定度', '模板套话', '语体门禁（可改写段） 通过', '删除/改写句首模板']) {
   if (!aigcText.includes(need)) failures.push(`AIGC 卡缺少：${need}`);
 }
 
@@ -149,11 +173,37 @@ const missingText = collectText(AigcCard({
       installScript: 'pip install torch==2.9.1 transformers==5.23.0',
     },
   },
-  target: 'original', onTarget: () => {}, onScore: () => {}, onDiag: () => {},
+  scores: {}, diags: {}, target: 'original', canRewrite: false,
+  onTarget: () => {}, onScore: () => {}, onDiag: () => {},
   onSelftest: () => {}, busy: '',
 })).join(' ');
-for (const need of ['依赖未安装', '已取消伪概率', 'pip install torch==2.9.1']) {
+for (const need of ['依赖未安装', '不会伪造分数', 'pip install torch==2.9.1']) {
   if (!missingText.includes(need)) failures.push(`缺依赖提示缺少：${need}`);
+}
+
+const validEdits = parseEditsText('{"pid":"p0001","text":"改写后","op":"O1"}');
+if (!validEdits.ok || validEdits.lines !== 1) failures.push('手动清单：合法 JSONL 没有通过');
+const invalidEdits = parseEditsText('这段是改写指令，不是清单。');
+if (invalidEdits.ok || !invalidEdits.hint.includes('改写指令')) {
+  failures.push('手动清单：错误输入没有指出「指令不是清单」');
+}
+if (!canStageEditsFor({ id: 'v1', status: 'planned' })) {
+  failures.push('手动清单：待回填版本必须允许保存清单');
+}
+if (canStageEditsFor({ id: 'v1', status: 'applied' })) {
+  failures.push('手动清单：已完成版本不应允许覆盖旧清单');
+}
+
+const versionsText = collectText(VersionBar({
+  versions: [
+    { id: 'original', label: '原文', status: 'original', downloadable: true },
+    { id: 'v1', label: '改稿', status: 'applied', baseId: 'original', downloadable: true },
+    { id: 'v2', label: '二改', status: 'planned', baseId: 'v1', downloadable: false },
+  ],
+  target: 'v1', onTarget: () => {}, busy: '',
+})).join(' ');
+for (const need of ['改稿版本', '改稿', '二改', '下载改稿', '切到任一版本']) {
+  if (!versionsText.includes(need)) failures.push(`版本栏缺少：${need}`);
 }
 
 // 首页三选一与报告页：结构必须能渲染出来
@@ -164,7 +214,7 @@ const homeText = collectText(ModeHome({
   docPath: '', onPath: () => {}, onDiagnose: () => {}, busy: '', lastRun: null,
   mode: null, onMode: () => {},
 })).join(' ');
-for (const need of ['降低篇内重复率', '降低 AIGC 率', '双降', '诊断']) {
+for (const need of ['降低篇内重复率', '降低 AI 疑似占比', '双降', '诊断']) {
   if (!homeText.includes(need)) failures.push(`首页缺少模式入口：${need}`);
 }
 
@@ -173,13 +223,13 @@ const reportText = collectText(ReportCard({
   metrics: [
     { label: '篇内重复', value: '24.1%' },
     { label: 'AIGC 风险', value: '2→1', tone: 'ok' },
-    { label: 'AIGC 概率', value: '49.7%→48.6%', tone: 'warn' },
+    { label: 'AI 疑似占比', value: '49.7%→48.6% · 存在 AI 特征段落', tone: 'warn' },
   ],
   report: '## 一、文档概览\n\n| 指标 | 数值 |\n|---|---|\n| 段落总数 | 862 |\n',
   extraMarkdown: '## AIGC 复检\n\n| 指标 | 改写前 | 改写后 |\n|---|---|---|\n| 风险项 | 2 | 1 |\n',
   onCopy: () => {}, copied: '', onClose: () => {},
 })).join(' ');
-for (const need of ['报告', '篇内重复 24.1%', 'AIGC 风险 2→1', 'AIGC 复检', '段落总数']) {
+for (const need of ['报告', '篇内重复 24.1%', 'AIGC 风险 2→1', 'AI 疑似占比 49.7%→48.6%', 'AIGC 复检', '段落总数']) {
   if (!reportText.includes(need)) failures.push(`报告页缺少：${need}`);
 }
 

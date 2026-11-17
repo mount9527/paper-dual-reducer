@@ -1,7 +1,7 @@
 {
   "name": "dsh-paper-dual",
-  "version": "0.6.0",
-  "description": "论文双降工作台：诊断中文论文 .docx 的 AI 文风与篇内重复，AIGC 考官打分 + 9 维痕迹诊断，闭环改写与三栏对照。",
+  "version": "0.8.0",
+  "description": "论文双降工作台：诊断中文论文 .doc/.docx 的 AI 文风与篇内重复，AIGC 考官打分 + 9 维痕迹诊断，闭环改写与三栏对照。",
   "type": "module",
   "license": "MIT",
   "author": "mount9527",
@@ -27,7 +27,10 @@
     "aigc/requirements.txt",
     "aigc/samples/*.txt",
     "docs/design.md",
-    "README.md"
+    "README.md",
+    "aigc/blocking.py",
+    "aigc/bands.py",
+    "aigc/calib.json"
   ],
   "dsh": {
     "bundle": {

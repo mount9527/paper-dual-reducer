@@ -62,13 +62,32 @@ if (doc) {
     : r;
   const rp = await call('/dsh-paper-dual/report?which=report.md');
   out.report = { ok: rp.json?.ok, len: rp.json?.text?.length ?? 0 };
+  const fullScore = await call('/dsh-paper-dual/aigc/score', 'POST', { target: 'original' });
+  out.aigcFullScore = {
+    ok: fullScore.json?.ok,
+    error: fullScore.json?.error,
+    aiShare: fullScore.json?.result?.ai_share,
+    allShare: fullScore.json?.result?.all_ai_share,
+    tableShare: fullScore.json?.result?.table_ai_share,
+    referenceShare: fullScore.json?.result?.reference_ai_share,
+    comparisonMode: fullScore.json?.result?.comparison_mode,
+    bodyChars: fullScore.json?.result?.body_chars,
+    band: fullScore.json?.result?.band,
+    stability: fullScore.json?.result?.stability,
+    calibrated: fullScore.json?.result?.calibrated,
+    blocks: fullScore.json?.result?.segments?.length,
+    coverage: fullScore.json?.result?.coverage,
+  };
   const bad = await call('/dsh-paper-dual/diagnose', 'POST', { path: 'Z:\\nope.docx' });
   out.badPath = { ok: bad.json?.ok, error: bad.json?.error };
 }
 
 // AIGC 考官：只依赖 python + 正则，任何机器都该跑通
 const as = await call('/dsh-paper-dual/aigc/status');
-out.aigcStatus = { ok: as.json?.ok, mode: as.json?.mode, detectorReady: as.json?.detectorReady };
+out.aigcStatus = {
+  ok: as.json?.ok, mode: as.json?.mode, detectorReady: as.json?.detectorReady,
+  calibrated: as.json?.calibration?.calibrated,
+};
 
 const SAMPLE = '随着数字化转型的不断深入，企业创新绩效的影响因素日益受到学界关注。'
   + '综上所述，本研究不仅丰富了理论体系，也为企业实践提供了有益参考。';
@@ -84,8 +103,11 @@ const asc = await call('/dsh-paper-dual/aigc/score', 'POST', { text: SAMPLE });
 out.aigcScore = {
   ok: asc.json?.ok,
   mode: asc.json?.mode,
-  aiProb: asc.json?.result?.ai_prob,
-  segments: asc.json?.result?.segments?.length,
+  aiShare: asc.json?.result?.ai_share,
+  band: asc.json?.result?.band,
+  calibrated: asc.json?.result?.calibrated,
+  stability: asc.json?.result?.stability,
+  blocks: asc.json?.result?.segments?.length,
 };
 
 const t = tools.find((x) => x.name === 'paper_dual_status');

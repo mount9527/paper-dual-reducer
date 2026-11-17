@@ -1,352 +1,213 @@
-# SPEC —— 实现规格书
+# SPEC · AIGC 分数口径 v3.1 / 插件 v0.8.0
 
-本文件是给实现方的契约。**动手前先读完，实现时不要偏离接口签名**；偏离会让 `selftest.py` 失效。
+v0.8.0 在 v3 的 A/B 两层上补齐三个工程约束：版本比较冻结基础稿块边界；正文、表格、参考文献分账；AIGC/双降回填强制模型复检。仍不包含语料拟合，不承诺与任何商业平台对齐。
 
----
+## 1. 目标与主指标
 
-## 1. 目标与非目标
+输入一篇中文学术论文，输出：
 
-**目标**：输入一篇中文学术论文，输出一篇改写稿与一个 AIGC 概率，且改写稿满足：
+- `ai_share`：**可改写正文块**中得分不低于 `thr_hi` 的字数 ÷ 可改写正文字数，作为主指标；
+- `all_ai_share`：全部块（正文 + 表格 + 参考文献 + 排除区）的同口径占比；
+- `table_ai_share` / `reference_ai_share`：表格与参考文献/附录分项；
+- `ai_share_hard`：块得分不低于 `thr_hard` 的字数占比；
+- `median_prob`：按块字数展开后的加权中位数；
+- `band`：`safe / warn / risk`；
+- `stability`：300 / 400 / 600 三种粒度下 `ai_share` 的极差；
+- 每块来源、块分和贡献度，用于定位高风险段落。
 
-- 本地检测器概率显著下降
-- 数字、引用、术语、结论方向完全不变
-- 学术书面语体不降级
+旧字段 `ai_prob` 保留，但值恒等于 `mean_prob`，只用于读取历史记录，不再作为改写前后优劣判据。
 
-**非目标（明确不做）**
+## 2. 切块契约
 
-- ❌ 论文查重（重复率）——那是另一条技术路线，需要比对语料库，本包不涉及
-- ❌ 与知网 / 维普 / Turnitin 分数对齐——没有校准集就做不到，不要假装能做到
-- ❌ 用 LLM 整篇重写——见第 12 节禁令
-
----
-
-## 2. 已有资产（不要重写）
-
-### 2.1 `detector.py`
+新增 `aigc/blocking.py`，导出：
 
 ```python
-class Detector:
-    def __init__(self, model_id: str = "yuchuantian/AIGC_detector_zhv3",
-                 device: str = "cpu", ai_index: int | None = None,
-                 max_tokens: int = 510) -> None: ...
-
-    def load(self) -> "Detector": ...
-    def calibrate(self, verbose: bool = False) -> dict: ...
-    def score_document(self, text: str) -> DocScore: ...
-    def _score_text(self, text: str) -> tuple[float, int]: ...
-    def _windows(self, n_tokens: int) -> list[tuple[int, int]]: ...
+Block(index, text, chars, kind, pid_span, truncated=False,
+      source_ranges=(), group='rewritable')
+split_blocks(text, target=400, hard_max=480, min_para=40, min_block=200,
+             paragraphs=None, break_before_indices=None)
+classify_blocks(blocks, paragraphs, locked_flags=None)
+plan_from_blocks(blocks)
+apply_block_plan(paragraphs, plan, hard_max=480)
+coverage(blocks, text)
 ```
+
+规则：
+
+1. 复用已解析段落顺序，`pid_span` 指向原段落区间；
+2. 少于 40 字的段落不独立打分；
+3. 连续 3 条以上碎片，且含至少 2 个数字或制表符时，合并为 `table`；超过硬上限时截断并设 `truncated=True`；
+4. 其余碎片优先并入后一个正文块，末段并入前一个正文块；
+5. 正文按 300–480 字聚合，尽量在句号、分号处断开；
+6. 正文块不足 200 字不进入分母；
+7. 可用块少于 3 个时，整篇单块打分，`degraded=True`，不输出块级定位。
+8. `source_ranges` 记录 `(pid, start_ratio, end_ratio)`，用于新版本文本重建；
+9. 参考文献/附录起点强制断块；分组为 `rewritable / table / reference / excluded`。
+
+默认粒度：`target=400, hard_max=480`。三粒度复算时，600 字粒度允许使用 600 字硬上限。
+
+## 3. 聚合与档位
+
+设块集合为 B，块字数为 `c_i`，块模型输出为 `p_i`：
+
+```text
+ai_share      = body Σ c_i · [p_i >= thr_hi]   / body Σ c_i
+ai_share_hard = body Σ c_i · [p_i >= thr_hard] / body Σ c_i
+all_ai_share  = all  Σ c_i · [p_i >= thr_hi]   / all  Σ c_i
+mean_prob     = Σ c_i · p_i               / Σ c_i
+median_prob   = weighted_median(p_i, c_i)
+```
+
+原文主指标取三种切分粒度正文 `ai_share` 的中位数，`stability=max-min`。后续版本传入基础稿 `block_plan`，`comparison_mode='frozen'`；没有冻结块的版本不得用于判优。
+
+档位：
+
+| 档位 | 条件 | 文案 |
+|---|---|---|
+| safe | `ai_share < 0.15` | AI 特征不明显 |
+| warn | `0.15 <= ai_share < 0.30` | 存在 AI 特征段落 |
+| risk | `ai_share >= 0.30` | AI 特征显著 |
+
+## 4. 配置与回退
+
+`aigc/calib.json` 是唯一阈值来源：
+
+```json
+{
+  "version": "2026-11-18",
+  "genre": "undergraduate_thesis",
+  "calibrated": false,
+  "thr_hi": 0.38,
+  "thr_hard": 0.85,
+  "band": {"safe_max": 0.15, "warn_max": 0.3},
+  "basis": {
+    "thr_hi": "human_academic_p95, n_chunks=73, provisional",
+    "band": "university_policy, 15pct_most_strict, 30pct_mode"
+  },
+  "n_docs_human": 3,
+  "n_chunks_human": 73
+}
+```
+
+文件缺失或损坏时，`aigc/bands.py` 回退到 `thr_hi=0.50`、`thr_hard=0.85`、档位线 `0.15/0.30`，并保持 `calibrated=False`。不得在业务代码里另写一套阈值。
+
+## 5. 检测器数据结构
 
 ```python
 @dataclass
 class SegmentScore:
-    index: int; chars: int; ai_prob: float; windows: int; preview: str
+    index: int
+    chars: int
+    ai_prob: float      # 单块模型输出，不是全文概率
+    windows: int
+    preview: str
+    kind: str
+    pid_span: tuple[int, int]
+    contribution: float
+    truncated: bool
+    group: str
 
 @dataclass
 class DocScore:
-    ai_prob: float          # 全文分，字数加权，0~1
-    chars: int; segments: list[SegmentScore]
-    ai_index: int; model: str; mode: str   # "model"
+    ai_prob: float      # deprecated alias of mean_prob
+    chars: int
+    segments: list[SegmentScore]
+    ai_index: int
+    model: str
+    mode: str
+    ai_share: float
+    ai_share_hard: float
+    median_prob: float
+    band: str
+    stability: float | None
+    thr_hi: float
+    thr_hard: float
+    calibrated: bool
+    degraded: bool
+    mean_prob: float
+    granularity: int
+    config_version: str
+    detectable_chars: int
+    coverage: float
+    body_chars: int
+    table_chars: int
+    reference_chars: int
+    excluded_chars: int
+    all_ai_share: float
+    table_ai_share: float | None
+    reference_ai_share: float | None
+    group_stats: dict
+    comparison_mode: str   # frozen / segmented
+    block_plan: list[dict]
 ```
 
-**不变式**（由 `selftest.py` 守护，改动必须让自检仍然全绿）：
+`to_dict()` 必须完整序列化上述字段。
 
-- 每个 token 至少被 1 个窗口覆盖
-- 首尾 token 恰好被覆盖 1 次
-- 任何窗口长度 ≤ `max_tokens`
-- 尾窗是整窗，不留残片
-- 恒定概率输入下，聚合结果精确等于该常数（重叠不重复计数）
+## 6. segscore.json 契约
 
-### 2.2 `diag.py`
+`aigc/segscore.py` 输出 `paper-dual-reduce/segscore@3`：
 
-```python
-def diagnose(text: str) -> DiagResult
-```
+- `paragraphs[]` 是语义块，不是原 doc.json 的全部段落；
+- `top[]` 按 `contribution` 降序，只保留 `group=rewritable`、未锁定且 `ai_prob >= threshold` 的块；
+- `pid` 是可改写的代表段号，`pid_span` 保留完整来源范围；
+- 全文字段必须与 `Detector.score_document` 一致；
+- 退化模式下 `paragraphs=[]`、`top=[]`。
+- `block_plan` 写入基础稿计划；后续版本用 `--plan block-plan.json` 复用，不接受重新切块结果作为前后对比。
 
-`DiagResult` 关键字段：`risk_count`（触发维度数）、`risk_score`（模板句式双权）、`level`（high/mid/low）、`style_gate_passed`、`todo`（作业清单）。
+## 7. 模型滑窗不变式
 
-**注意**：`style_gate_passed == False` 表示语体被破坏，**不代表文本是 AI 写的**。这两个概念在代码里必须分开表达，不要合并成一个"AI 分数"。
+模型上限 512 token，实际窗口 `max_tokens=510`：
 
-### 2.3 `segscore.py`
+- 每个 token 至少被一个窗口覆盖；
+- 首尾 token 恰好覆盖一次；
+- 任意窗口不超过 `max_tokens`；
+- 尾窗为整窗；
+- 重叠区按 token 级平均，不重复计数。
 
-读取论文引擎生成的 `doc.json`，保留原始 `pid`，逐段调用同一个 `Detector`，输出
-`paper-dual-reduce/segscore@1`：
+这些不变式由 `selftest.py` 守护。
 
-- `paragraphs[]` 与 `doc.json` 中非空段落同序
-- `top[]` 只保留未锁定且概率 ≥ 阈值的段落
-- 全文分 = 段落概率按字数加权
-- 只接受真机分数；不存在伪概率或 fallback 分数
+## 8. CLI
 
----
-
-## 3. 待实现清单
-
-### P0 —— 单篇闭环（3 天）
-
-| # | 任务 | 验收 |
-|---|---|---|
-| 1 | 真实模型冒烟：跑通 `detector.py --calibrate` 与 `--file` | 标定 gap ≥ 0.15，exit 0；两样本的 AI 稿分数 > 人写稿分数 |
-| 2 | `guard.py`：四道校验 | 对 10 组"人为改坏"的文本，四类破坏各能拦下 |
-| 3 | `rewriter/word_level.py`：词级确定性替换 | 同一输入两次运行输出完全一致 |
-| 4 | `rewriter/sent_level.py`：四类句级变换 | 每种变换有单测；同段内同类变换不超过 1 次 |
-| 5 | `controller.py`：闭环调度 | 单篇能跑完最多 3 轮，输出每轮分数轨迹 |
-
-### P1 —— 可用（5 天）
-
-| # | 任务 | 验收 |
-|---|---|---|
-| 6 | `span_guard.py`：protected spans 识别 | 引用/公式/百分比/术语识别召回 ≥ 95% |
-| 7 | `rewriter/llm_span.py`：受限 LLM 改写 | 输出必须过护栏，否则整段回滚 |
-| 8 | `output/writer.py`：docx 回写保格式 | 改写后 docx 打开无格式错位，图片/公式/脚注完好 |
-| 9 | `report.py`：段落高亮报告 | 能定位到具体段落与命中的诊断维度 |
-
-### P2 —— 可评估（3 天）
-
-| # | 任务 | 验收 |
-|---|---|---|
-| 10 | 双向 benchmark | SF/SNF 各 30 篇，输出规避率与误改率 |
-| 11 | 阈值回归脚本 | 换模型后一键重跑，输出维度漂移报告 |
-
----
-
-## 4. 第一步必做：真实模型验证
-
-本机未安装 torch，真实权重从未跑过。接手后第一个动作是：
-
-```bash
-pip install -r requirements.txt
+```text
+python detector.py --file paper.txt --json
+python detector.py --file paper.txt --json --fast
 python detector.py --calibrate
+python segscore.py --doc original.json --out original-score.json --plan-out block-plan.json
+python segscore.py --doc revised.json --out revised-score.json --plan block-plan.json
 ```
 
-**期望**：`trusted: true`，`gap ≥ 0.15`。
+`--threshold` 只覆盖定位阈值，不改变 `calib.json` 或档位线。
 
-**如果 `gap < 0.15`**，说明探针句在该模型上没有区分度，按顺序尝试：
+## 9. 界面与兼容
 
-1. 把 `AI_PROBES` 换成更长的 AI 稿片段（≥100 字，纯 AI 生成）
-2. 把 `HUMAN_PROBES` 换成更口语化的人写片段
-3. 仍不行则用 `--ai-label 0` / `--ai-label 1` 手动试，用 3 篇已知来源的文本人工确认方向
+- 主数字统一叫「正文 AI 疑似占比」，表格/参考文献单列；
+- 显示 `band`、`calibrated`、`stability`、块数和块覆盖率；
+- `calibrated=False` 必须显示「未校准」水印；
+- 历史结果只有 `ai_prob` 时标成「旧口径」，不得与新记录直接相减；
+- 改写循环和下一轮定位只使用 `group=rewritable` 的 `ai_share` 与 `contribution`；
+- AIGC/双降回填必须自动做冻结块模型复检；模型缺失、未冻结块或正文占比上升均判失败并回退；
+- 面板固定显示三条免责声明：不可跨平台横比、以本校平台为准、阈值仅用于定位。
 
-**不要**因为标定失败就去改 `calibrate()` 里的阈值来"让它通过"——那等于放弃这项检查。
+## 10. 验收
 
-验证完毕后记录实测数据（供后续回归对比）：
+```text
+python selftest.py
+# 期望：22/22 通过
 
-| 样本 | 期望 | 实测 ai_prob（ai_index） | 备注 |
-|---|---|---|---|
-| `samples/ai_sample.txt` | 高 | ______ | |
-| `samples/human_sample.txt` | 低 | ______ | |
-| `samples/colloquial_bad.txt` | 不应过高 | ______ | 口语化会干扰检测器，属已知现象 |
-
----
-
-## 5. 512 token 截断：能修吗？
-
-**结论：模型层面不能修，工程层面已完整绕过。**
-
-- 不能修的原因：zhv3 的 `config.json` 中 `max_position_embeddings = 512`，BERT 用绝对位置编码，扩长必须重新训练位置编码，不是改配置能解决的。
-- 已实现的绕过：`detector.py::_windows` + token 级聚合。无信息损失（除跨窗口的长距离依赖），代价是推理次数变为 N 倍。
-
-### 5.1 窗口算法（不要改）
-
-```
-if n <= max_tokens: 返回 [(0, n)]
-stride = int(max_tokens * 0.75)
-while start + max_tokens < n:
-    产出 (start, start + max_tokens)
-    start += stride
-若末窗未覆盖到 n：追加 (n - max_tokens, n)（若与末窗相同则不追加）
+python detector.py --file samples/human_sample.txt --json --fast
+# 期望：真实模型输出新字段；不再输出 percentile
 ```
 
-`max_tokens = 510` 而非 512，为 `[CLS]` / `[SEP]` 留位。
+三粒度回归要求：
 
-### 5.2 聚合公式（关键）
+- 同文极差不超过 0.06；
+- 同一输入重复运行结果完全一致；
+- 16k 字样本块数约 35–45；
+- 正文块不足 200 字或超过默认 480 字均为 0；
+- 不足 40 字独立推理请求为 0。
+- 同一原稿/改稿的 `pid_span` 列表必须完全一致；
+- 表格与参考文献不进入正文 top 改写列表。
 
-**错误做法**：把所有窗口概率算术平均。重叠区会被重复计数，分数向窗口内容偏斜。
+## 11. 边界
 
-**正确做法**：token 级加权。
-
-```
-acc[i] = Σ 覆盖 token i 的窗口的概率
-cnt[i] = 覆盖 token i 的窗口数
-p_token[i] = acc[i] / cnt[i]
-text_prob = mean(p_token)
-```
-
-**全文分**：`Σ(段落分 × 段字数) / 总字数`。不是段落算术平均——否则 50 字的引言和 800 字的分析段等权，短段会过度影响结果。
-
-### 5.3 残余限制（必须写进交付说明）
-
-分块后得到的是**局部风格统计的加权**，不是整篇语义判断。若论文存在跨段落的统一节奏（如全文每段都以"此外"起头），滑窗无法捕捉这类长距离模式。这是方法论限制，不是 bug，不要试图用"更长窗口"解决。
-
----
-
-## 6. 标签标定规格
-
-`config.json` 缺 `id2label`，因此方向必须实测。`calibrate()` 的逻辑：
-
-```
-p1_ai    = mean( index=1 在 AI 探针上的概率 )
-p1_human = mean( index=1 在人写探针上的概率 )
-gap = p1_ai - p1_human
-ai_index = 1 if gap > 0 else 0
-trusted  = abs(gap) >= 0.15
-```
-
-- `trusted == False` → **抛 RuntimeError，不返回结果**。宁可失败，不要静默给出可能反向的分数。
-- 标定结果应缓存到本地文件（如 `.calibration.json`），避免每次启动重跑；换模型时缓存失效。
-
----
-
-## 7. 阈值表（集中管理，不要散落在函数里）
-
-| 维度 | 阈值 | 出处 |
-|---|---|---|
-| 模板句式命中数 | > 3 处 | aigc-reduce |
-| 被动语态 | > 0.30 /句 | aigc-reduce |
-| 句长 CV | < 0.35 中风险，< 0.25 高风险 | aigc-reduce |
-| 段落对称 | 连续 3 段偏差 < 20% | aigc-reduce |
-| 嵌套编号 | > 3 处 | aigc-reduce |
-| 冒号并列 | > 1 处 | aigc-reduce |
-| 逗号密度 | > 2.5 /句 | aigc-reduce |
-| 口语词 | > 0 处即门禁失败 | aigc-reduce |
-| 破折号 | > 1 /段即门禁失败 | aigc-reduce |
-| 修改率目标 | > 40% | aigc-reduce（经验值） |
-
-> 这些阈值来自 `xiaofenggan01/aigc-reduce`（MIT）的经验设定，**不是严格实验结果**。换模型或换语料后需要重标。重标时只改 `LIMITS`，不要改函数。
-
----
-
-## 8. 护栏规格（四道，缺一不可）
-
-| # | 校验 | 实现要点 | 不通过处置 |
-|---|---|---|---|
-| 1 | 数字一致 | 抽取 `\d+(\.\d+)?%?` 及其单位，比对集合；注意保留原文顺序无关 | 回滚该段 |
-| 2 | 引用一致 | 抽取 `[n]`、`[n-m]`、`(作者, 年份)`、`（作者，年份）`、脚注上标 | 回滚该段 |
-| 3 | 语义保真 | `BAAI/bge-small-zh-v1.5` 句向量，段落级余弦 ≥ 0.85 | 回滚或重写 |
-| 4 | 语体门禁 | 复用 `diag.colloquial()` 与 `diag.dash_density()`，均须为 0 | 回滚该段 |
-
-补充第 5 道（业务层）：术语保留率 ≥ 95%。术语表从原文抽取（jieba + 领域词典，或简单的 3-gram 高频 + 白名单）。
-
-**回滚语义**：回滚到该段的「上一个通过护栏的版本」，不是回到原文。若规则版也过不了，回滚到原文并记录。
-
----
-
-## 9. 改写算子规格
-
-### 9.1 三级贡献
-
-| 层级 | 手段 | 修改率贡献 |
-|---|---|---|
-| 词级 | 模板词替换、AI 高频词替换（每处用不同替代词） | 10–15% |
-| 句级 | 语序重组、长句拆分、被动改主动、主语更换 | 15–20% |
-| 段落级 | 打破对称段长、段间过渡改写 | 10–15% |
-
-### 9.2 句级变换约束
-
-- 同一段落内，同一类变换最多使用 1 次（否则产生新的模式化）
-- 长句拆分在语义边界切，目标 15–30 字，**不得拆成电报体碎句**
-- 被动改主动**保留方法学合规被动**（"样品被置于…"这类不能改）
-
-### 9.3 受限 LLM 改写
-
-只在「高风险段落」调用，且必须带输出契约：
-
-```
-只改写以下段落，保持：
-- 全部数字、百分比、单位、P 值不变
-- 全部引用标记不变
-- 全部专业术语、方法名、模型名不变
-- 学术书面语体，不出现口语、网络用语、情绪词
-- 每段破折号不超过 1 个
-- 不得新增原文没有的事实、数据、案例、文献
-仅输出改写后的段落，不要解释。
-```
-
-输出**必须**过第 8 节四道护栏，任一不过则整段回滚为规则改写版本。
-
----
-
-## 10. docx 保格式
-
-用 `python-docx` 按 run 级替换，不要整段替换字符串——整段替换会丢失加粗、上标引用、域代码。
-
-要点：
-
-- 先把段落拆成 run，只在目标 span 所在 run 内改
-- 受保护片段（公式、图表号、引用上标、脚注引用）的 run 不参与改写
-- 表格默认跳过（诊断器与检测器都不处理表格内容）
-- 改写结果写**新文件**，不原地修改
-
----
-
-## 11. 验收标准
-
-全部可执行，逐条通过才算交付：
-
-```bash
-# 1. 自检全绿
-python selftest.py                       # exit 0，13/13
-
-# 2. 标定可信
-python detector.py --calibrate           # trusted: true, gap >= 0.15
-
-# 3. 方向正确（AI 稿分数应高于人写稿）
-python detector.py --file samples/ai_sample.txt    --json
-python detector.py --file samples/human_sample.txt --json
-
-# 4. 门禁有效
-python diag.py --file samples/colloquial_bad.txt   # 语体门禁 FAIL，exit 1
-python diag.py --file samples/human_sample.txt     # 语体门禁 PASS，exit 0
-
-# 5. 闭环可复现（同一输入两次运行，输出一致）
-python detector.py --file samples/ai_sample.txt --json | md5sum
-python detector.py --file samples/ai_sample.txt --json | md5sum
-```
-
-**P0 的业务验收**：对一篇真实论文，改写后
-
-- 段落平均 AIGC 概率下降
-- 四道护栏全程无漏放（故意改坏 10 处，全部被拦）
-- 人工通读无口语化、无事实改动
-
-**不要用"分数降了 30 个百分点"作为验收门槛**——绝对水平取决于检测器，且已知不可靠。验收的是**方向、可复现性、护栏有效性**。
-
----
-
-## 12. 禁止事项（触犯即方案失效）
-
-1. **禁止用 LLM 整篇重写。** AI 重写 AI 文本会叠加指纹，社区实测检测率反而升到 100%。改写只能局部、受限、可回溯。
-2. **禁止为降分编造**数据、案例、文献、实验细节。
-3. **禁止靠口语化降分。** 口语词能骗过统计检测器，但过不了人审。语体优先级高于修改率——冲突时宁可停在 38%。
-4. **禁止串通检测器。** 不要用"改写后立刻用同一模型打分并把分数写进报告"当成效果证明，必须用独立样本做双向 benchmark。
-5. **禁止宣称与任何商业平台等效。** 报告里写"本地模型分"，不要写"AIGC 率"。
-6. **禁止改 `selftest.py` 里的断言来让测试通过。** 若要改不变式，先在 SPEC 里说明理由。
-
----
-
-## 13. 数据契约
-
-`score_document` 的 JSON 输出（`--json`）：
-
-```json
-{
-  "ai_prob": 0.4638,
-  "chars": 310,
-  "segments": [
-    {"index": 0, "chars": 103, "ai_prob": 0.5067, "windows": 1, "preview": "随着数字化转型的不断深入……"}
-  ],
-  "ai_index": 1,
-  "model": "yuchuantian/AIGC_detector_zhv3",
-  "mode": "model"
-}
-```
-
-`diagnose` 的 JSON 输出：见 `diag.py::DiagResult.to_dict()`，字段固定，新增字段只能追加不能改名。
-
----
-
-## 14. 参考
-
-- 检测模型：`yuchuantian/AIGC_detector_zhv3`（apache-2.0，22.8k 下载）
-- 规则与阈值：`xiaofenggan01/aigc-reduce`（MIT）
-- 模式分类与硬约束：`redbaronyyyyy-eng/humanizer-zh-academic`（MIT）
-- 背景论证：同目录 `降AIGC率技术实施方案.md`
+本指标是本工具自有口径下的 AI 疑似占比，不是任何平台的概率，不是学术不端判决，也不承诺通过率。阈值 `0.38` 的样本量不足且体裁只是近似，`calibrated` 必须保持 `false`，直到有足够合法、同体裁的校准证据。

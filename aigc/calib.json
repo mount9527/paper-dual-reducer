@@ -1,0 +1,17 @@
+{
+  "version": "2026-11-18",
+  "genre": "undergraduate_thesis",
+  "calibrated": false,
+  "thr_hi": 0.38,
+  "thr_hard": 0.85,
+  "band": {
+    "safe_max": 0.15,
+    "warn_max": 0.3
+  },
+  "basis": {
+    "thr_hi": "human_academic_p95, n_chunks=73, provisional",
+    "band": "university_policy, 15pct_most_strict, 30pct_mode"
+  },
+  "n_docs_human": 3,
+  "n_chunks_human": 73
+}

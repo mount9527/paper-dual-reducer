@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-detector.py —— 「考官」：中文 AIGC 文本检测器封装
+"""detector.py —— 中文 AIGC 检测器封装（A/B 两层口径）。
 
-把 HuggingFace 上的 AIGC 检测模型包装成一个可直接调用的打分组件，
-解决三个工程问题：标签方向未知、512 token 截断、全文分数口径不一致。
+A 层：块级模型分聚合为 AI 疑似占比、档位与稳定性。
+B 层：把短段噪声合并为 300-480 字语义块，并按三粒度复算。
 
-设计决策（改动前请先读）：
-1. 直接操作 logits，不用 pipeline —— pipeline 输出的 label 名是 LABEL_0/LABEL_1，
-   不携带语义；且我们必须在标定前拿到两类原始概率。
-2. 按 token 级做窗口聚合，而不是按窗口算术平均 —— 重叠窗口若直接平均，
-   重叠区会被重复计数，导致分数向窗口内容偏斜。
-3. max_tokens = 510 而非 512 —— 给 [CLS] / [SEP] 留位置。
-4. 全文分 = 段落分按字数加权，不是段落算术平均 —— 否则短段落权重过高。
-
-依赖：transformers + torch
-模型权重许可：见对应 HuggingFace 页面（zhv3 为 apache-2.0）
+设计边界：
+1. 直接操作 logits，不依赖 pipeline 的未知标签名。
+2. 长文本按 token 级滑窗聚合，重叠区不重复计数。
+3. 全文主指标是 ai_share，不是概率均值；ai_prob 仅保留兼容。
+4. 阈值和档位全部来自 calib.json；缺失时按规格回退。
 """
 
 from __future__ import annotations
@@ -23,18 +17,32 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import statistics
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
+
+from bands import band_label, band_of, load as load_bands
+from blocking import (
+    Block,
+    apply_block_plan,
+    backmatter_start,
+    classify_blocks,
+    coverage,
+    plan_from_blocks,
+    split_blocks,
+)
 
 DEFAULT_MODEL = "yuchuantian/AIGC_detector_zhv3"
 MAX_TOKENS = 510
 STRIDE_RATIO = 0.75
 BATCH_SIZE = 16
-DEFAULT_THRESHOLD = 0.5
+DEFAULT_THRESHOLD: Optional[float] = None
+STABILITY_TARGETS = (300, 400, 600)
+DEFAULT_TARGET = 400
 
-# 标签方向标定用的探针句。要求：短（远低于 510 token）、语义明确、风格典型。
-# 标定只依赖「AI 组相对人组偏高」这一相对关系，不依赖绝对分数。
+# 标签方向标定探针只判断 0/1 的相对方向，不承担语料校准。
 AI_PROBES = [
     "综上所述，本研究具有重要的理论意义与实践价值，为相关领域提供了新的思路。",
     "随着信息技术的飞速发展，人工智能在各行各业得到了广泛应用，深刻改变了人们的生产和生活方式。",
@@ -54,18 +62,23 @@ HUMAN_PROBES = [
 
 @dataclass
 class SegmentScore:
-    """单个段落的打分结果。"""
+    """单个语义块的打分结果。"""
 
     index: int
     chars: int
     ai_prob: float
     windows: int
     preview: str = ""
+    kind: str = "body"
+    pid_span: Tuple[int, int] = (0, 0)
+    contribution: float = 0.0
+    truncated: bool = False
+    group: str = "rewritable"
 
 
 @dataclass
 class DocScore:
-    """整篇文档的打分结果。"""
+    """整篇文档的打分与口径信息。"""
 
     ai_prob: float
     chars: int
@@ -73,21 +86,40 @@ class DocScore:
     ai_index: int
     model: str
     mode: str = "model"
+    ai_share: float = 0.0
+    ai_share_hard: float = 0.0
+    median_prob: float = 0.0
+    band: str = "safe"
+    stability: Optional[float] = None
+    thr_hi: Optional[float] = None
+    thr_hard: Optional[float] = None
+    calibrated: bool = False
+    degraded: bool = False
+    mean_prob: float = 0.0
+    granularity: int = DEFAULT_TARGET
+    config_version: str = ""
+    detectable_chars: int = 0
+    coverage: float = 0.0
+    body_chars: int = 0
+    table_chars: int = 0
+    reference_chars: int = 0
+    excluded_chars: int = 0
+    all_ai_share: float = 0.0
+    table_ai_share: Optional[float] = None
+    reference_ai_share: Optional[float] = None
+    group_stats: dict = field(default_factory=dict)
+    comparison_mode: str = "segmented"
+    block_plan: List[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        d = asdict(self)
-        return d
+        return asdict(self)
 
 
 # ─────────────────────────── 文本切分 ───────────────────────────
 
 
 def split_paragraphs(text: str) -> List[str]:
-    """按空行切段落；若只有一整块，则按句号切成 ~400 字的伪段落。
-
-    为什么要退化切分：单段超长文本若整块送去滑窗，虽然不会崩，
-    但段落级报告会退化成一行，失去「哪几段像 AI」的定位能力。
-    """
+    """按空行切段；超长单块按句号切成约 400 字的伪段落。"""
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
         return []
@@ -107,11 +139,76 @@ def split_paragraphs(text: str) -> List[str]:
     return paras
 
 
+def _weighted_median(pairs: Sequence[Tuple[float, int]]) -> float:
+    valid = [(float(p), max(0, int(n))) for p, n in pairs if n > 0]
+    total = sum(n for _, n in valid)
+    if not total:
+        return 0.0
+    half = total / 2.0
+    acc = 0
+    for prob, weight in sorted(valid, key=lambda item: item[0]):
+        acc += weight
+        if acc >= half:
+            return prob
+    return sorted(valid, key=lambda item: item[0])[-1][0]
+
+
+def _aggregate(scored: Sequence[Tuple[Block, float, int]], config: dict) -> dict:
+    total = sum(block.chars for block, _, _ in scored)
+    if not total:
+        return {
+            "mean_prob": 0.0,
+            "ai_share": 0.0,
+            "ai_share_hard": 0.0,
+            "median_prob": 0.0,
+            "numerator": 0.0,
+        }
+    numerator = sum(block.chars for block, prob, _ in scored if prob >= float(config["thr_hi"]))
+    numerator_hard = sum(
+        block.chars for block, prob, _ in scored if prob >= float(config["thr_hard"])
+    )
+    return {
+        "mean_prob": sum(block.chars * prob for block, prob, _ in scored) / total,
+        "ai_share": numerator / total,
+        "ai_share_hard": numerator_hard / total,
+        "median_prob": _weighted_median([(p, b.chars) for b, p, _ in scored]),
+        "numerator": numerator,
+    }
+
+
+def _group_stats(scored: Sequence[Tuple[Block, float, int]], config: dict) -> dict:
+    stats = {}
+    for group in ("rewritable", "table", "reference", "excluded"):
+        subset = [item for item in scored if item[0].group == group]
+        if not subset:
+            stats[group] = {
+                "blocks": 0,
+                "chars": 0,
+                "ai_share": None,
+                "ai_share_hard": None,
+                "median_prob": None,
+                "mean_prob": None,
+                "numerator": 0,
+            }
+            continue
+        metrics = _aggregate(subset, config)
+        stats[group] = {
+            "blocks": len(subset),
+            "chars": sum(block.chars for block, _, _ in subset),
+            "ai_share": metrics["ai_share"],
+            "ai_share_hard": metrics["ai_share_hard"],
+            "median_prob": metrics["median_prob"],
+            "mean_prob": metrics["mean_prob"],
+            "numerator": metrics["numerator"],
+        }
+    return stats
+
+
 # ─────────────────────────── 检测器 ───────────────────────────
 
 
 class Detector:
-    """AIGC 检测器。真实使用流程：Detector().load().calibrate().score_document(text)"""
+    """真实使用流程：Detector().load().calibrate().score_document(text)。"""
 
     def __init__(
         self,
@@ -119,6 +216,7 @@ class Detector:
         device: str = "cpu",
         ai_index: Optional[int] = None,
         max_tokens: int = MAX_TOKENS,
+        config_path: Optional[str | Path] = None,
     ) -> None:
         self.model_id = model_id
         self.device = device
@@ -127,6 +225,8 @@ class Detector:
         self.tokenizer = None
         self.model = None
         self.calibration: Optional[dict] = None
+        self.calibration_config_path = Path(config_path) if config_path else None
+        self.calibration_config = load_bands(self.calibration_config_path)
         self._torch = None
 
     # ---- 加载 ----
@@ -140,10 +240,9 @@ class Detector:
                 "缺少依赖：pip install -r requirements.txt（transformers + torch）"
             ) from exc
 
+        self.calibration_config = load_bands(self.calibration_config_path)
         self._torch = torch
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
-        # 显式 num_labels=2：zhv3 的 config.json 缺 num_labels，不写会走默认值，
-        # 虽然默认也是 2，但显式声明可在换模型时避免静默错配。
         self.model = AutoModelForSequenceClassification.from_pretrained(
             self.model_id, num_labels=2, use_safetensors=False
         )
@@ -163,7 +262,6 @@ class Detector:
         return None
 
     def _build_inputs_with_special_tokens(self, ids: Sequence[int]) -> List[int]:
-        """兼容 transformers 4/5 的 tokenizer API 迁移。"""
         ids = list(ids)
         fn = getattr(self.tokenizer, "build_inputs_with_special_tokens", None)
         if callable(fn):
@@ -182,7 +280,6 @@ class Detector:
     # ---- 前向 ----
 
     def _probs_batch(self, id_lists: Sequence[Sequence[int]]) -> List[Tuple[float, float]]:
-        """返回每个序列的 (p0, p1)。批次过大时自动切分。"""
         out: List[Tuple[float, float]] = []
         for i in range(0, len(id_lists), BATCH_SIZE):
             chunk = list(id_lists[i : i + BATCH_SIZE])
@@ -199,14 +296,6 @@ class Detector:
     # ---- 窗口规划 ----
 
     def _windows(self, n_tokens: int) -> List[Tuple[int, int]]:
-        """按 token 生成 [start, end) 窗口。
-
-        不变式（由 selftest.test_windows_no_gap 守护）：
-          - 每个 token 至少被 1 个窗口覆盖
-          - 首尾 token 恰好被覆盖 1 次（否则边缘分数会向窗口内容偏斜）
-          - 任何窗口长度 <= max_tokens
-          - 尾窗是整窗，不留残片
-        """
         if n_tokens <= self.max_tokens:
             return [(0, n_tokens)]
         stride = max(1, int(self.max_tokens * STRIDE_RATIO))
@@ -223,25 +312,19 @@ class Detector:
                 wins.append(tail)
         return wins
 
-    # ---- 打分 ----
-
     def _score_text(self, text: str) -> Tuple[float, int]:
-        """返回 (AI 概率, 窗口数)。概率为 token 级加权平均。"""
         if not text.strip():
             return 0.0, 0
-
         ids = self.tokenizer(text, add_special_tokens=False, truncation=False)["input_ids"]
         n = len(ids)
         if n == 0:
             return 0.0, 0
-
         wins = self._windows(n)
         payload = [
             self._build_inputs_with_special_tokens(ids[s:e]) for s, e in wins
         ]
         raws = self._probs_batch(payload)
         p_ai = [r[self.ai_index or 0] for r in raws]
-
         acc = [0.0] * n
         cnt = [0] * n
         for (s, e), p in zip(wins, p_ai):
@@ -253,51 +336,230 @@ class Detector:
             return 0.0, len(wins)
         return sum(per_token) / len(per_token), len(wins)
 
-    def score_document(self, text: str) -> DocScore:
-        paras = split_paragraphs(text)
-        if not paras:
-            return DocScore(0.0, 0, [], self.ai_index or -1, self.model_id, "model")
+    def _pack_run(
+        self,
+        target: int,
+        blocks: Sequence[Block],
+        text: str,
+    ) -> dict:
+        scored = [
+            (block, *self._score_text(block.text))
+            for block in blocks
+        ]
+        body_scored = [item for item in scored if item[0].group == "rewritable"]
+        all_metrics = _aggregate(scored, self.calibration_config)
+        body_metrics = _aggregate(body_scored, self.calibration_config)
+        return {
+            "target": target,
+            "blocks": list(blocks),
+            "scored": scored,
+            "body_scored": body_scored,
+            "coverage": coverage(blocks, text),
+            "group_stats": _group_stats(scored, self.calibration_config),
+            "all_ai_share": all_metrics["ai_share"],
+            "all_ai_share_hard": all_metrics["ai_share_hard"],
+            **body_metrics,
+        }
 
-        segs: List[SegmentScore] = []
-        for i, p in enumerate(paras):
-            prob, nw = self._score_text(p)
-            segs.append(
-                SegmentScore(
-                    index=i,
-                    chars=len(p),
-                    ai_prob=round(prob, 4),
-                    windows=nw,
-                    preview=p[:40].replace("\n", " "),
-                )
-            )
+    def _score_at_granularity(
+        self,
+        text: str,
+        paras: Sequence[str],
+        target: int,
+        locked_flags: Sequence[bool] | None = None,
+    ) -> dict:
+        hard_max = 480 if target <= 480 else target
+        boundary = backmatter_start(paras)
+        blocks = split_blocks(
+            text,
+            target=target,
+            hard_max=hard_max,
+            min_para=40,
+            min_block=200,
+            paragraphs=paras,
+            break_before_indices={boundary} if boundary < len(paras) else None,
+        )
+        blocks = classify_blocks(blocks, paras, locked_flags)
+        return self._pack_run(target, blocks, text)
 
-        total_chars = sum(s.chars for s in segs) or 1
-        doc_prob = sum(s.ai_prob * s.chars for s in segs) / total_chars
+    def _score_frozen_plan(
+        self,
+        paras: Sequence[str],
+        plan: Sequence[dict],
+        locked_flags: Sequence[bool] | None = None,
+    ) -> dict:
+        blocks = apply_block_plan(paras, plan, hard_max=480)
+        # 计划分组来自基础稿；若基础稿没有分组信息，再按新版段落补分类。
+        if any(block.group not in {"rewritable", "table", "reference", "excluded"}
+               for block in blocks):
+            blocks = classify_blocks(blocks, paras, locked_flags)
+        target = int(plan[0].get("target", DEFAULT_TARGET)) if plan else DEFAULT_TARGET
+        return self._pack_run(target, blocks, "\n\n".join(paras))
+
+    def _empty_score(self, config: dict) -> DocScore:
         return DocScore(
-            ai_prob=round(doc_prob, 4),
-            chars=len(text),
-            segments=segs,
+            ai_prob=0.0,
+            chars=0,
+            segments=[],
             ai_index=self.ai_index if self.ai_index is not None else -1,
             model=self.model_id,
             mode="model",
+            band=band_of(0.0, config),
+            thr_hi=float(config["thr_hi"]),
+            thr_hard=float(config["thr_hard"]),
+            calibrated=bool(config.get("calibrated", False)),
+            mean_prob=0.0,
+            config_version=str(config.get("version", "")),
+            coverage=1.0,
+        )
+
+    def score_document(
+        self,
+        text: str,
+        fast: bool = False,
+        paragraphs: Sequence[str] | None = None,
+        locked_flags: Sequence[bool] | None = None,
+        block_plan: Sequence[dict] | None = None,
+    ) -> DocScore:
+        """正文主指标取三粒度中位；传入 block_plan 时冻结基础稿块边界。"""
+        self.calibration_config = load_bands(self.calibration_config_path)
+        config = self.calibration_config
+        paras = list(paragraphs) if paragraphs is not None else split_paragraphs(text)
+        if not paras:
+            return self._empty_score(config)
+
+        comparison_mode = "frozen" if block_plan else "segmented"
+        if block_plan:
+            selected = self._score_frozen_plan(paras, block_plan, locked_flags)
+            runs = [selected]
+            degraded = False
+        else:
+            default_run = self._score_at_granularity(
+                text, paras, DEFAULT_TARGET, locked_flags,
+            )
+            degraded = len(default_run["blocks"]) < 3
+            if degraded:
+                boundary = backmatter_start(paras)
+                full_block = Block(
+                    index=0,
+                    text=text,
+                    chars=len(re.sub(r"\s+", "", text)),
+                    kind="body",
+                    pid_span=(0, max(0, len(paras) - 1)),
+                    source_ranges=tuple((i, 0.0, 1.0) for i in range(len(paras))),
+                    group="rewritable" if boundary else "reference",
+                )
+                selected = self._pack_run(DEFAULT_TARGET, [full_block], text)
+                selected["coverage"] = 1.0
+                runs = [selected]
+            else:
+                targets = (DEFAULT_TARGET,) if fast else STABILITY_TARGETS
+                runs = [
+                    default_run if target == DEFAULT_TARGET
+                    else self._score_at_granularity(
+                        text, paras, target, locked_flags,
+                    )
+                    for target in targets
+                ]
+                median_share = statistics.median(run["ai_share"] for run in runs)
+                selected = min(
+                    runs,
+                    key=lambda run: (
+                        abs(run["ai_share"] - median_share),
+                        0 if run["target"] == DEFAULT_TARGET else 1,
+                    ),
+                )
+
+        stability = None
+        if comparison_mode == "segmented" and not fast and not degraded:
+            values = [run["ai_share"] for run in runs]
+            stability = max(values) - min(values)
+
+        segments: List[SegmentScore] = []
+        if not degraded:
+            for block, prob, windows in selected["scored"]:
+                group_metrics = selected["group_stats"].get(block.group) or {}
+                numerator = float(group_metrics.get("numerator") or 0.0)
+                contribution = (
+                    block.chars / numerator
+                    if numerator > 0 and prob >= float(config["thr_hi"])
+                    else 0.0
+                )
+                segments.append(SegmentScore(
+                    index=block.index,
+                    chars=block.chars,
+                    ai_prob=round(float(prob), 4),
+                    windows=windows,
+                    preview=block.text[:40].replace("\n", " "),
+                    kind=block.kind,
+                    pid_span=block.pid_span,
+                    contribution=round(contribution, 4),
+                    truncated=block.truncated,
+                    group=block.group,
+                ))
+
+        final_share = float(selected["ai_share"])
+        mean_prob = float(selected["mean_prob"])
+        stats = selected["group_stats"]
+        body_stats = stats.get("rewritable") or {}
+        table_stats = stats.get("table") or {}
+        reference_stats = stats.get("reference") or {}
+        excluded_stats = stats.get("excluded") or {}
+        return DocScore(
+            ai_prob=round(mean_prob, 4),
+            chars=len(text),
+            segments=segments,
+            ai_index=self.ai_index if self.ai_index is not None else -1,
+            model=self.model_id,
+            mode="model",
+            ai_share=round(final_share, 4),
+            ai_share_hard=round(float(selected["ai_share_hard"]), 4),
+            median_prob=round(float(selected["median_prob"]), 4),
+            band=band_of(final_share, config),
+            stability=round(stability, 4) if stability is not None else None,
+            thr_hi=round(float(config["thr_hi"]), 4),
+            thr_hard=round(float(config["thr_hard"]), 4),
+            calibrated=bool(config.get("calibrated", False)),
+            degraded=degraded,
+            mean_prob=round(mean_prob, 4),
+            granularity=int(selected["target"]),
+            config_version=str(config.get("version", "")),
+            detectable_chars=sum(block.chars for block in selected["blocks"]),
+            coverage=round(float(selected["coverage"]), 4),
+            body_chars=int(body_stats.get("chars") or 0),
+            table_chars=int(table_stats.get("chars") or 0),
+            reference_chars=int(reference_stats.get("chars") or 0),
+            excluded_chars=int(excluded_stats.get("chars") or 0),
+            all_ai_share=round(float(selected["all_ai_share"]), 4),
+            table_ai_share=(
+                round(float(table_stats["ai_share"]), 4)
+                if table_stats.get("ai_share") is not None else None
+            ),
+            reference_ai_share=(
+                round(float(reference_stats["ai_share"]), 4)
+                if reference_stats.get("ai_share") is not None else None
+            ),
+            group_stats=stats,
+            comparison_mode=comparison_mode,
+            block_plan=(
+                list(block_plan) if block_plan
+                else plan_from_blocks(selected["blocks"])
+            ),
         )
 
     # ---- 标签方向标定 ----
 
     def calibrate(self, verbose: bool = False) -> dict:
-        """用 AI 探针组 / 人写探针组判定哪个下标代表 AI。
-
-        判据：比较 index=1 在两组探针上的均值，AI 组更高则 ai_index=1。
-        若两组差异小于 0.15，判定为「不可信」，抛错要求人工指定 --ai-label。
-        """
         if self.model is None:
             self.load()
 
         def mean_p1(texts: Sequence[str]) -> float:
             payload = [
                 self._build_inputs_with_special_tokens(
-                    self.tokenizer(t, add_special_tokens=False, truncation=True,
-                                   max_length=self.max_tokens)["input_ids"]
+                    self.tokenizer(
+                        t, add_special_tokens=False, truncation=True,
+                        max_length=self.max_tokens,
+                    )["input_ids"]
                 )
                 for t in texts
             ]
@@ -340,39 +602,58 @@ def _bar(p: float, width: int = 20) -> str:
     return "█" * n + "·" * (width - n)
 
 
-def _print_report(doc: DocScore, threshold: float) -> None:
-    print("=" * 64)
-    print("  AIGC 检测报告")
-    print("=" * 64)
+def _print_report(doc: DocScore, threshold: Optional[float] = None) -> None:
+    thr = doc.thr_hi if threshold is None else threshold
+    print("=" * 72)
+    print("  AIGC 检测报告（AI 疑似占比）")
+    print("=" * 72)
     print(f"  模型      : {doc.model}")
-    print(f"  模式      : {doc.mode}")
-    print(f"  标签方向  : ai_index = {doc.ai_index}")
-    print(f"  总字数    : {doc.chars}")
-    print(f"  段落数    : {len(doc.segments)}")
+    print(f"  配置      : {doc.config_version or 'unknown'}")
+    print(f"  校准状态  : {'已校准' if doc.calibrated else '未校准（阈值为占位值）'}")
+    print(f"  正文块    : {len(doc.segments)} ｜ 正文字数 {doc.body_chars} / {doc.chars}")
+    print(f"  比较口径  : {'冻结基础稿块' if doc.comparison_mode == 'frozen' else '重新切块'}")
+    print(f"  块覆盖率  : {doc.coverage:.1%}")
     print()
-    print(f"  全文 AI 概率（字数加权）: {doc.ai_prob * 100:.1f}%  [{_bar(doc.ai_prob)}]")
+    print(
+        f"  正文 AI 疑似占比: {doc.ai_share * 100:.1f}%  [{_bar(doc.ai_share)}] "
+        f"｜ {band_label(doc.band)}"
+    )
+    print(
+        f"  全篇/表格/参考文献: {doc.all_ai_share * 100:.1f}% / "
+        f"{'—' if doc.table_ai_share is None else f'{doc.table_ai_share * 100:.1f}%'} / "
+        f"{'—' if doc.reference_ai_share is None else f'{doc.reference_ai_share * 100:.1f}%'}"
+    )
+    print(f"  硬阈值占比: {doc.ai_share_hard * 100:.1f}% ｜ 块得分中位数 {doc.median_prob:.4f}")
+    if doc.stability is not None:
+        print(f"  切分稳定度: {doc.stability:.4f}（极差，越小越稳）")
+    if doc.degraded:
+        print("  退化保护  : 可用块不足 3 个，已按整篇单块打分，不输出定位")
     print()
-    risky = [s for s in doc.segments if s.ai_prob >= threshold]
-    print(f"  超过阈值 {threshold:.2f} 的段落: {len(risky)} / {len(doc.segments)}")
-    print("-" * 64)
-    print(f"  {'#':>3}  {'字数':>5}  {'AI%':>6}  {'窗口':>4}  预览")
-    for s in doc.segments:
-        flag = "!" if s.ai_prob >= threshold else " "
-        print(
-            f"  {s.index:>3}  {s.chars:>5}  {s.ai_prob * 100:>5.1f}%{flag} "
-            f"{s.windows:>4}    {s.preview}"
-        )
-    print("=" * 64)
+    if doc.segments:
+        risky = [s for s in doc.segments if s.ai_prob >= (thr if thr is not None else 0)]
+        print(f"  块得分 ≥ {float(thr or 0):.2f} 的块: {len(risky)} / {len(doc.segments)}")
+        print("-" * 72)
+        print(f"  {'#':>3}  {'字数':>5}  {'块分':>6}  {'贡献':>7}  {'类型':>5}  预览")
+        for s in sorted(doc.segments, key=lambda item: item.contribution, reverse=True):
+            flag = "!" if thr is not None and s.ai_prob >= thr else " "
+            span = f"{s.pid_span[0]}-{s.pid_span[1]}"
+            print(
+                f"  {s.index:>3}  {s.chars:>5}  {s.ai_prob * 100:>5.1f}%{flag} "
+                f"{s.contribution:>7.1%}  {s.kind:>5}  [{span}] {s.preview}"
+            )
+    print("=" * 72)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="AIGC 检测器封装（考官）",
+        description="AIGC 检测器封装（AI 疑似占比口径）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="示例:\n"
-        "  python detector.py --calibrate\n"
-        "  python detector.py --file samples/ai_sample.txt\n"
-        "  python detector.py --text \"待检测文本\" --json\n",
+        epilog=(
+            "示例:\n"
+            "  python detector.py --calibrate\n"
+            "  python detector.py --file samples/ai_sample.txt\n"
+            "  python detector.py --text \"待检测文本\" --json --fast\n"
+        ),
     )
     ap.add_argument("--file", help="待检测文本文件（UTF-8）")
     ap.add_argument("--text", help="直接传入文本")
@@ -380,12 +661,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--device", default="cpu", help="cpu / cuda")
     ap.add_argument("--ai-label", type=int, choices=(0, 1), help="手动指定 AI 对应的下标")
     ap.add_argument("--calibrate", action="store_true", help="只做标签方向标定")
-    ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    ap.add_argument("--threshold", type=float, default=None, help="报告展示用块阈值覆盖")
+    ap.add_argument("--fast", action="store_true", help="只跑 400 字粒度，stability 记为 null")
+    ap.add_argument("--calib", help="可选 calib.json 路径")
     ap.add_argument("--json", action="store_true", help="输出 JSON")
     args = ap.parse_args(argv)
 
     det = Detector(
-        model_id=args.model, device=args.device, ai_index=args.ai_label,
+        model_id=args.model,
+        device=args.device,
+        ai_index=args.ai_label,
+        config_path=args.calib,
     )
     det.load()
 
@@ -407,7 +693,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.print_help()
         return 2
 
-    doc = det.score_document(text)
+    doc = det.score_document(text, fast=args.fast)
     if args.json:
         print(json.dumps(doc.to_dict(), ensure_ascii=False, indent=2))
     else:

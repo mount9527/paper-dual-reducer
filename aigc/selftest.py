@@ -17,9 +17,12 @@ selftest.py —— 离线自检：不下载模型也能验证核心逻辑
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Sequence, Tuple
 
+import bands as B
+import blocking as K
 import detector as D
 import diag as G
 import segscore as S
@@ -108,14 +111,26 @@ def test_ai_index_respected():
 
 
 @case
-def test_doc_score_is_char_weighted():
-    """两段等概率时，字数加权应等于该概率；断言不依赖段落数量。"""
-    det = make_detector(max_tokens=10)
-    det._probs_batch = lambda payloads: [(0.5, 0.5) for _ in payloads]
-    text = "甲" * 100 + "\n\n" + "乙" * 5
-    doc = det.score_document(text)
-    assert abs(doc.ai_prob - 0.5) < 1e-6, f"加权口径异常: {doc.ai_prob}"
-    assert len(doc.segments) == 2
+def test_doc_score_uses_share_and_keeps_legacy_mean():
+    """主指标是超阈值字数占比；ai_prob 只保留为 mean_prob 的兼容别名。"""
+    det = make_detector(max_tokens=2000)
+    probabilities = {"甲": 0.9, "乙": 0.5, "丙": 0.1}
+
+    def fake_score(text):
+        first = next(ch for ch in text if ch in probabilities)
+        return probabilities[first], 1
+
+    det._score_text = fake_score
+    text = "\n\n".join(key * 300 for key in ("甲", "乙", "丙"))
+    doc = det.score_document(text, fast=True)
+    assert len(doc.segments) == 3, len(doc.segments)
+    assert abs(doc.ai_share - 2 / 3) < 1e-4, doc.ai_share
+    assert abs(doc.median_prob - 0.5) < 1e-6, doc.median_prob
+    assert abs(doc.mean_prob - 0.5) < 1e-6, doc.mean_prob
+    assert abs(doc.ai_prob - doc.mean_prob) < 1e-9, "旧字段必须等于 mean_prob"
+    assert doc.band == "risk"
+    assert abs(sum(s.contribution for s in doc.segments) - 1.0) < 1e-4
+    assert doc.stability is None
 
 
 @case
@@ -199,6 +214,151 @@ def test_diag_clean_text_passes_gate():
     )
     r = G.diagnose(clean)
     assert r.style_gate_passed is True, f"干净文本不应触发门禁: {r.colloquial['terms']}"
+
+
+@case
+def test_blocking_document_shape_and_coverage():
+    text = "\n\n".join("甲" * 50 for _ in range(320))
+    blocks = K.split_blocks(text, target=400, hard_max=480)
+    assert 35 <= len(blocks) <= 45, f"块数异常: {len(blocks)}"
+    assert min(block.chars for block in blocks) >= 200
+    assert max(block.chars for block in blocks) <= 480
+    assert K.coverage(blocks, text) >= 0.85
+
+
+@case
+def test_blocking_merges_table_and_marks_truncation():
+    frags = ["123\t456\t789" for _ in range(50)]
+    text = "\n\n".join(frags)
+    blocks = K.split_blocks(text, target=400, hard_max=480)
+    assert blocks and blocks[0].kind == "table", [block.kind for block in blocks]
+    assert blocks[0].truncated is True
+    assert blocks[0].chars <= 480
+
+
+@case
+def test_band_boundaries_come_from_policy_config():
+    cfg = B.load()
+    assert cfg["thr_hi"] == 0.38
+    assert cfg["calibrated"] is False
+    assert B.band_of(0.1499, cfg) == "safe"
+    assert B.band_of(0.15, cfg) == "warn"
+    assert B.band_of(0.2999, cfg) == "warn"
+    assert B.band_of(0.30, cfg) == "risk"
+
+
+@case
+def test_missing_config_uses_spec_fallback():
+    cfg = B.load(Path("__missing_calib__.json"))
+    assert cfg["thr_hi"] == 0.50
+    assert cfg["thr_hard"] == 0.85
+    assert cfg["band"] == {"safe_max": 0.15, "warn_max": 0.30}
+    assert cfg["calibrated"] is False
+
+
+@case
+def test_weighted_median_expands_block_chars():
+    p = D._weighted_median([(0.1, 90), (0.9, 10)])
+    assert p == 0.1, p
+
+
+@case
+def test_three_granularity_stability_and_serialization():
+    det = make_detector(max_tokens=2000)
+    det._probs_batch = lambda payloads: [(0.2, 0.8) for _ in payloads]
+    text = "\n\n".join("甲" * 50 for _ in range(32))
+    doc = det.score_document(text)
+    assert doc.stability is not None
+    assert abs(doc.stability) < 1e-6
+    data = doc.to_dict()
+    for key in (
+        "ai_share", "ai_share_hard", "median_prob", "band", "stability",
+        "thr_hi", "thr_hard", "calibrated", "degraded",
+    ):
+        assert key in data, key
+    assert "kind" in data["segments"][0]
+    assert "pid_span" in data["segments"][0]
+    assert "contribution" in data["segments"][0]
+
+
+@case
+def test_short_document_degrades_without_block_localization():
+    det = make_detector(max_tokens=2000)
+    det._probs_batch = lambda payloads: [(0.2, 0.8) for _ in payloads]
+    doc = det.score_document("甲" * 300 + "\n\n" + "乙" * 300)
+    assert doc.degraded is True
+    assert doc.segments == []
+    assert doc.ai_share == 1.0
+
+
+@case
+def test_body_table_reference_are_measured_separately():
+    det = make_detector(max_tokens=2000)
+
+    def fake_score(text):
+        if text.startswith("甲"):
+            return 0.80, 1
+        if text.startswith("乙"):
+            return 0.10, 1
+        return 0.95, 1
+
+    det._score_text = fake_score
+    paras = [
+        "甲" * 300,
+        "乙" * 300,
+        "表 1",
+        "1\t2",
+        "3\t4",
+        "参考文献",
+        "丙" * 300,
+    ]
+    text = "\n\n".join(paras)
+    doc = det.score_document(text, fast=True, paragraphs=paras)
+    assert doc.body_chars == 600, doc.body_chars
+    assert doc.table_chars > 0, doc.table_chars
+    assert doc.reference_chars > 0, doc.reference_chars
+    assert abs(doc.ai_share - 0.5) < 1e-6, doc.ai_share
+    assert doc.table_ai_share == 1.0, doc.table_ai_share
+    assert doc.reference_ai_share == 1.0, doc.reference_ai_share
+    assert doc.all_ai_share > doc.ai_share
+
+
+@case
+def test_frozen_block_plan_reuses_base_boundaries():
+    det = make_detector(max_tokens=2000)
+    det._score_text = lambda text: (0.6, 1)
+    base_paras = ["甲" * 300, "乙" * 300, "丙" * 300, "丁" * 300]
+    base_text = "\n\n".join(base_paras)
+    base = det.score_document(base_text, fast=True, paragraphs=base_paras)
+    plan = base.block_plan
+    assert plan
+
+    revised_paras = [
+        base_paras[0][:240] + "甲" * 60,
+        base_paras[1][:180],
+        base_paras[2] + "新增短语。",
+        base_paras[3][:200],
+    ]
+    revised_text = "\n\n".join(revised_paras)
+    revised = det.score_document(
+        revised_text,
+        fast=True,
+        paragraphs=revised_paras,
+        block_plan=plan,
+    )
+    assert revised.comparison_mode == "frozen"
+    assert stable_spans(revised.block_plan) == stable_spans(plan)
+
+
+def stable_spans(plan):
+    return [
+        (
+            block.get("kind"),
+            tuple(block.get("pid_span") or []),
+            tuple(tuple(range_row) for range_row in (block.get("source_ranges") or [])),
+        )
+        for block in plan
+    ]
 
 
 def main() -> int:

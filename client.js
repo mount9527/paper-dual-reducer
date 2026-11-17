@@ -1,4 +1,4 @@
-// dsh-paper-dual · 客户端半边（v0.2，浏览器模块，无 node:fs）
+// dsh-paper-dual · 客户端半边（v0.8.0，浏览器模块，无 node:fs）
 // 平台按 __ModuleLoader__ 工厂格式直接加载，不经打包。
 //
 // 结构：常量/配色 → 小部件 → Panel（诊断 → 生成任务 → 预检 → 回填复检 → 三栏对照）→ 注册
@@ -294,6 +294,39 @@ window.__ModuleLoader__.load({
     }
 
     // 路径太长时不换行、不撑破面板：保留首段与末两级，中间省略；tooltip 给全路径
+    // 面板里贴的清单：只认 JSONL，一行一条 {"pid","text","op"}。
+    function parseEditsText(text) {
+      const lines = String(text || '').split('\n').map((s) => s.trim()).filter(Boolean);
+      if (!lines.length) return { ok: false, empty: true, lines: 0, error: '', hint: '' };
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        let row = null;
+        try { row = JSON.parse(line); } catch {
+          const looksLikeProse = /[，。；、！？]/.test(line) || line.length > 240 || !/^[{[]/.test(line);
+          return {
+            ok: false,
+            empty: false,
+            lines: lines.length,
+            error: `第 ${i + 1} 行不是合法 JSON`,
+            hint: looksLikeProse
+              ? '这段看着是「改写指令」而不是清单 —— 指令发给模型，这里贴模型产出的结果：'
+                + '一行一条 {"pid":"p0003","text":"改写后的整段文字","op":"O1"}。'
+              : '每行必须是一个完整 JSON 对象，字段至少要有 pid 与 text。',
+          };
+        }
+        if (!row || typeof row.pid !== 'string' || typeof row.text !== 'string') {
+          return {
+            ok: false,
+            empty: false,
+            lines: lines.length,
+            error: `第 ${i + 1} 行缺少 pid 或 text`,
+            hint: '格式：{"pid":"p0003","text":"改写后的整段文字","op":"O1"}',
+          };
+        }
+      }
+      return { ok: true, empty: false, lines: lines.length, error: '', hint: '' };
+    }
+
     function shortPath(p) {
       const s = String(p || '');
       if (s.length <= 48) return s;
@@ -385,7 +418,7 @@ window.__ModuleLoader__.load({
         }, `· ${c}`)),
         h('div', {
           key: 'next', style: { fontSize: 11, color: C.dim, marginTop: 8, lineHeight: 1.6 },
-        }, '模型写完后，回到这里点「回填并复检」。'),
+        }, '模型写完后，回到这里点「回填并 AIGC 复检」。'),
         h('div', { key: 'b', style: { display: 'flex', gap: 8, marginTop: 9 } }, [
           h(Btn, { key: 'c', onClick: onCopy, primary: true }, copied ? '已复制' : '复制整段指令'),
         ]),
@@ -423,6 +456,48 @@ window.__ModuleLoader__.load({
       ['dash', '破折号', (v) => `${v.total} 处${v.gate_failed ? ' · 超限' : ''}`],
     ];
 
+    function versionLabelForIndex(index) {
+      if (!index) return '原文';
+      if (index === 1) return '改稿';
+      const digits = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+      return `${index < 10 ? digits[index] : index}改`;
+    }
+
+    function canStageEditsFor(currentVersion) {
+      return Boolean(currentVersion)
+        && (currentVersion.id === 'original' || ['planned', 'preparing'].includes(currentVersion.status));
+    }
+
+    function scoreShareOf(result) {
+      const share = Number(result?.ai_share);
+      if (Number.isFinite(share)) return share;
+      const legacy = Number(result?.ai_prob);
+      return Number.isFinite(legacy) ? legacy : null;
+    }
+
+    function scoreIsLegacy(result) {
+      return Boolean(result) && (
+        !Number.isFinite(Number(result.ai_share))
+        || !result.group_stats
+        || (result.schema && result.schema !== 'paper-dual-reduce/segscore@3')
+      );
+    }
+
+    const BAND_LABELS = {
+      safe: 'AI 特征不明显',
+      warn: '存在 AI 特征段落',
+      risk: 'AI 特征显著',
+    };
+
+    function bandOfScore(result, share) {
+      if (['safe', 'warn', 'risk'].includes(result?.band)) return result.band;
+      const value = Number(share);
+      if (!Number.isFinite(value)) return '';
+      if (value < 0.15) return 'safe';
+      if (value < 0.30) return 'warn';
+      return 'risk';
+    }
+
     function ProbBar({ value, color }) {
       const pct = Math.max(2, Math.min(100, Math.round((value ?? 0) * 100)));
       return h('div', {
@@ -430,28 +505,140 @@ window.__ModuleLoader__.load({
       }, h('div', { style: { width: `${pct}%`, height: '100%', background: color } }));
     }
 
-    function AigcCard({ status, score, diag, delta, aiLabel, target, onTarget, onScore, onDiag,
-      onSelftest, onCalibrate, onDelta, onCopy, copied, busy }) {
+    // 版本链选择器：原文、改稿、二改、三改……都由服务端真实版本驱动。
+    function TargetTabs({ target, onTarget, versions }) {
+      const items = (versions?.length ? versions : [
+        { id: 'original', label: '原文', downloadable: true, status: 'original' },
+      ]);
+      return h('div', {
+        style: {
+          display: 'flex', borderRadius: 7, overflowX: 'auto', border: `1px solid ${C.border}`,
+          maxWidth: '100%',
+        },
+      }, items.map((item, index) => {
+        const active = target === item.id;
+        const suffix = item.status === 'planned' ? ' · 待回填'
+          : item.status === 'checking' ? ' · 复检中'
+          : item.status === 'rejected' ? ' · 未过'
+            : '';
+        const hint = item.id === 'original'
+          ? '诊断时保存的原文快照'
+          : `${item.label}${item.baseLabel ? `，基于${item.baseLabel}` : ''}`
+            + (item.downloadable ? '；已有可下载 docx' : '；尚未回填生成 docx');
+        return h('button', {
+          key: item.id,
+          type: 'button',
+          title: hint,
+          onClick: () => onTarget(item.id),
+          style: {
+            padding: '4px 12px', fontSize: 11, border: 'none',
+            cursor: 'pointer',
+            background: active ? C.accent : 'transparent',
+            color: active ? '#fff' : C.dim,
+            borderLeft: index ? `1px solid ${C.border}` : 'none',
+            whiteSpace: 'nowrap',
+          },
+        }, `${item.label}${suffix}`);
+      }));
+    }
+
+    function VersionBar({
+      versions, target, onTarget, onDownload, busy,
+    }) {
+      const current = versions?.find((v) => v.id === target) ?? versions?.[0] ?? null;
+      const canDownload = Boolean(current?.downloadable);
+      return h('div', {
+        style: {
+          border: `1px solid ${C.border}`, borderRadius: 10, padding: 10,
+          background: C.card, display: 'flex', flexDirection: 'column', gap: 7,
+          position: 'sticky', top: 0, zIndex: 18,
+          backdropFilter: 'blur(10px)', boxShadow: '0 4px 14px rgba(0,0,0,0.08)',
+        },
+      }, [
+        h('div', {
+          key: 'h', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+        }, [
+          h('span', { key: 't', style: { fontSize: 12, fontWeight: 600 } }, '改稿版本'),
+          h('span', { key: 's', style: { fontSize: 10.5, color: C.dim } },
+            versions?.length > 2 ? `共 ${versions.length - 1} 版改稿` : '原稿与迭代稿分别保存'),
+        ]),
+        h('div', {
+          key: 'tabs-row',
+          style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 },
+        }, [
+          h('div', { key: 'tabs-wrap', style: { flex: 1, minWidth: 0 } },
+            h(TargetTabs, { versions, target, onTarget })),
+          canDownload ? h('a', {
+            key: 'dl',
+            href: api(`${PREFIX}/download?version=${encodeURIComponent(current.id)}`),
+            download: '',
+            style: {
+              flex: '0 0 auto', padding: '6px 11px', borderRadius: 7, textDecoration: 'none',
+              background: C.accent, color: '#fff', fontSize: 12, whiteSpace: 'nowrap',
+            },
+          }, `下载${current.label}`) : h('span', {
+            key: 'nodl',
+            style: { flex: '0 0 auto', fontSize: 10.5, color: C.subtle },
+          }, `${current?.label || '当前版本'}待回填`),
+        ]),
+        h('div', {
+          key: 'hint', style: { fontSize: 10.5, color: C.subtle, lineHeight: 1.65 },
+        }, '切到任一版本后，下面的 AIGC、任务、预检、回填、报告和下载都会刷新到该版本。'
+          + '最多到五改；三改后自动进入快速定向模式，只改少量高风险段落。'),
+      ]);
+    }
+
+    function AigcCard({
+      status, scores, diags, delta, aiLabel, target, versionLabel, baseLabel, baseId, canRewrite,
+      versions, onTarget,
+      onScore, onDiag, onSelftest, onCalibrate, onDelta, onCopy, copied, busy,
+    }) {
       const missing = status?.detectorReady === false || status?.mode === 'unavailable';
-      const r = missing ? null : score?.result;
-      const d = diag?.result;
-      const prob = r ? Number(r.ai_prob) : null;
-      const probColor = prob == null ? C.dim : prob >= 0.65 ? C.high : prob >= 0.4 ? C.mid : C.low;
+      const current = scores?.[target] ?? null;
+      const currentDiag = diags?.[target] ?? null;
+      const r = missing ? null : current?.result;
+      const d = currentDiag?.result;
+      const share = r ? scoreShareOf(r) : null;
+      const legacy = scoreIsLegacy(r);
+      const band = r ? bandOfScore(r, share) : '';
+      const bandColor = band === 'risk' ? C.high : band === 'warn' ? C.mid : C.low;
+      const calibrated = r?.calibrated === true;
       const setup = status?.setup;
       const installScript = setup?.installScript || '';
-
+      const label = versionLabel || (target === 'original' ? '原文' : '当前改稿');
+      const baseScore = baseId ? scores?.[baseId] : null;
+      const baseShare = baseScore?.result ? scoreShareOf(baseScore.result) : null;
+      const baseLegacy = scoreIsLegacy(baseScore?.result);
+      const segments = (r?.segments ?? []).slice().sort((a, b) => (
+        Number(b.contribution ?? 0) - Number(a.contribution ?? 0)
+        || Number(b.ai_prob ?? 0) - Number(a.ai_prob ?? 0)
+      )).filter((seg) => !seg.group || seg.group === 'rewritable');
+      const groupStats = r?.group_stats ?? {};
+      const bodyStats = groupStats.rewritable ?? {};
+      const tableStats = groupStats.table ?? {};
+      const referenceStats = groupStats.reference ?? {};
+      const pctOrDash = (value) => (
+        Number.isFinite(Number(value)) ? `${(100 * Number(value)).toFixed(1)}%` : '—'
+      );
       const segRow = (seg) => {
-        const p = Number(seg.ai_prob);
-        const col = p >= 0.65 ? C.high : p >= 0.4 ? C.mid : C.low;
+        const blockScore = Number(seg.ai_prob);
+        const contribution = Number(seg.contribution ?? 0);
+        const threshold = Number(r?.thr_hi ?? 0.38);
+        const col = blockScore >= Math.max(0.85, threshold) ? C.high
+          : blockScore >= threshold ? C.mid : C.low;
         return h('div', {
-          key: `s${seg.index}`,
+          key: 's' + (seg.index ?? 0) + '-' + (seg.pid_span?.[0] ?? 0),
           style: { display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0', fontSize: 11.5 },
         }, [
-          h('code', { key: 'i', style: { fontSize: 11, color: C.dim, width: 16 } }, seg.index),
-          h(ProbBar, { key: 'b', value: p, color: col }),
+          h('code', { key: 'i', style: { fontSize: 11, color: C.dim, minWidth: 55 } },
+            '#' + seg.index + ' ' + (seg.kind === 'table' ? '表' : '文')),
+          h(ProbBar, { key: 'b', value: blockScore, color: col }),
           h('span', {
-            key: 'p', style: { width: 42, textAlign: 'right', color: col, fontSize: 11 },
-          }, `${(100 * p).toFixed(0)}%`),
+            key: 'p', style: { width: 58, textAlign: 'right', color: col, fontSize: 11 },
+          }, '块分 ' + (100 * blockScore).toFixed(0) + '%'),
+          h('span', {
+            key: 'c', style: { width: 68, textAlign: 'right', color: contribution > 0 ? C.mid : C.subtle, fontSize: 10.5 },
+          }, '贡献 ' + (100 * contribution).toFixed(1) + '%'),
           h('span', {
             key: 't', style: { flex: 1, minWidth: 0, color: C.dim, overflow: 'hidden',
               textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
@@ -467,27 +654,31 @@ window.__ModuleLoader__.load({
           style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 },
         }, [
           h('span', { key: 't', style: { fontSize: 12, fontWeight: 600 } }, 'AIGC 考官'),
-          h('span', { key: 'm', style: { fontSize: 11, color: C.dim } }, '模型检测 + 9 维痕迹'),
+          h('span', { key: 'm', style: { fontSize: 11, color: C.dim } }, '正文 AI 疑似占比 + 9 维痕迹'),
           h('span', { key: 's', style: { flex: 1 } }),
           h(Pill, {
             key: 'p', tone: missing ? 'warn' : 'ok', title: status?.note,
           }, missing ? '依赖未安装' : '真机'),
+          r ? h(Pill, {
+            key: 'cal', tone: calibrated ? 'ok' : 'warn',
+            title: calibrated ? '阈值有校准依据' : 'calib.json 的 calibrated=false，阈值为占位值',
+          }, calibrated ? '已校准' : '未校准') : null,
           aiLabel != null ? h(Pill, {
             key: 'al', tone: 'ok', title: '标签方向已标定（0/1 哪个代表 AI）',
           }, `已标定 ${aiLabel}`) : null,
           h(Btn, { key: 'st', onClick: onSelftest, disabled: busy === 'selftest' }, '自检'),
           h(Btn, {
             key: 'cl', onClick: onCalibrate, disabled: busy === 'aigcCalib',
-            title: '标定 0/1 哪个代表 AI（真机必做）',
-          }, busy === 'aigcCalib' ? '校准中…' : '校准'),        ]),
+            title: '只标定 0/1 哪个代表 AI；不代表语料刻度已校准',
+          }, busy === 'aigcCalib' ? '校准中…' : '方向标定'),        ]),
         h('div', {
           key: 'what',
           style: { fontSize: 11, color: C.dim, lineHeight: 1.75, marginBottom: 8 },
         }, [
           h('div', { key: '1' },
-            '这页三步：① 给整篇打一个「像不像 AI 写的」概率 → ② 看 9 类 AI 痕迹体检 → ③ 把痕迹要求交给改写。'),
+            '主数字是「被判为疑似 AI 的字数 ÷ 可检测字数」，不是概率；档位按 15% / 30% 政策线阅读。'),
           h('div', { key: '2' },
-            '读法：概率 0–100%，越高越像 AI；9 维里带黄点的是本轮要改的点；「改写作业清单」就是下一轮改写的具体要求。'),
+            '块分是单个 300–480 字语义块的模型输出；贡献度表示它占全文分子的比例，定位优先看贡献度。'),
         ]),
 
         missing ? h('div', {
@@ -500,11 +691,10 @@ window.__ModuleLoader__.load({
           h('div', { key: 'h', style: { fontSize: 12, color: C.mid, fontWeight: 650, marginBottom: 5 } },
             'AIGC 真机依赖未安装'),
           h('div', { key: 'why', style: { fontSize: 11, color: C.dim, lineHeight: 1.7, marginBottom: 8 } },
-            '没有 torch + transformers 时，AIGC 概率不可用。插件已取消伪概率，不再用随机数伪造分数。'
-            + '9 维痕迹体检仍可离线使用。'),
+            '没有 torch + transformers 时，AI 疑似占比不可用。插件不会伪造分数；9 维痕迹体检仍可离线使用。'),
           h('div', { key: 'steps', style: { display: 'flex', gap: 8, alignItems: 'center', marginBottom: 5 } }, [
             h('span', { key: 't', style: { fontSize: 11.5, color: C.dim, flex: 1 } },
-              '把下面整段复制到 PowerShell 执行（默认装到 E 盘，约 0.8GB 依赖）：'),
+              `${setup?.installTitle || '安装 transformers + torch'}：把下面整段复制到 PowerShell 执行（默认装到 E 盘）：`),
             h(Btn, { key: 'cp', onClick: () => onCopy?.('install', installScript) },
               copied === 'install' ? '已复制' : '复制安装命令'),
           ]),
@@ -519,7 +709,7 @@ window.__ModuleLoader__.load({
           h('div', { key: 'after', style: { fontSize: 10.5, color: C.dim, lineHeight: 1.75, marginTop: 7 } }, [
             h('div', { key: '1' }, `解释器填：${setup?.python || 'E:\\paper-dual-aigc\\Scripts\\python.exe'}`),
             h('div', { key: '2' }, `模型缓存填：${setup?.modelCacheDir || 'E:\\paper-dual-aigc\\hf-cache'}`),
-            h('div', { key: '3' }, '保存设置后点「校准」；首次会自动下载约 409MB 模型权重。'),
+            h('div', { key: '3' }, '保存设置后点「方向标定」；首次会自动下载约 409MB 模型权重。'),
           ]),
           h('div', {
             key: 'cur', style: { fontSize: 10.5, color: C.subtle, marginTop: 5, wordBreak: 'break-all' },
@@ -530,30 +720,46 @@ window.__ModuleLoader__.load({
           key: 'bar',
           style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 },
         }, [
-          h('div', { key: 'seg', style: { display: 'flex', borderRadius: 7, overflow: 'hidden',
-            border: `1px solid ${C.border}` } },
-          ['original', 'rewritten'].map((t, i) => h('button', {
-            key: t, type: 'button', onClick: () => onTarget(t),
-            style: {
-              padding: '4px 10px', fontSize: 11, cursor: 'pointer', border: 'none',
-              background: target === t ? C.accent : 'transparent',
-              color: target === t ? '#fff' : C.dim,
-              borderLeft: i ? `1px solid ${C.border}` : 'none',
-            },
-          }, t === 'original' ? '原文' : '改稿'))),
+          h(TargetTabs, { key: 'versions', versions, target, onTarget }),
           h(Btn, {
             key: 'sc', onClick: onScore, primary: true,
-            disabled: busy === 'aigcScore' || missing,
-            title: missing ? '先安装 torch + transformers 并填写 python 解释器' : '',
+            disabled: busy === 'aigcScore' || missing || !canRewrite,
+            title: !canRewrite ? '当前版本尚未生成 docx'
+              : missing ? '先安装 torch + transformers 并填写 python 解释器' : '',
           },
-            busy === 'aigcScore' ? '检测中…' : '检测 AIGC 率'),
-          h(Btn, { key: 'dg', onClick: onDiag, disabled: busy === 'aigcDiag' },
+            busy === 'aigcScore' ? '三粒度检测中…' : `检测${label}`),
+          h(Btn, { key: 'dg', onClick: onDiag, disabled: busy === 'aigcDiag' || !canRewrite },
             busy === 'aigcDiag' ? '体检中…' : 'AI 痕迹体检'),
           h(Btn, {
-            key: 'dl', onClick: onDelta, disabled: busy === 'aigcDelta' || missing,
-            title: '对原文和改稿各打一次分，看差了多少',
+            key: 'dl', onClick: onDelta, disabled: busy === 'aigcDelta' || missing || !canRewrite || target === 'original',
+            title: '对基础稿和当前稿各跑一次同口径检测',
           }, busy === 'aigcDelta' ? '对比中…' : '前后对比'),
         ]),
+
+        !canRewrite ? h('div', {
+          key: 'nocanrewrite',
+          style: { fontSize: 10.5, color: C.subtle, lineHeight: 1.6, marginBottom: 4 },
+        }, `${label}还没有生成 docx：先完成回填，才有这一份可检测。`) : null,
+
+        (baseScore?.result && target !== 'original' && r) ? h('div', {
+          key: 'dual',
+          style: {
+            display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap',
+            fontSize: 11.5, marginBottom: 4,
+          },
+        }, [
+          h('span', { key: 'l', style: { color: C.dim } }, (baseLabel || '原文') + ' / ' + label),
+          h('span', { key: 'o' }, (baseLabel || '基础稿') + ' '
+            + (baseShare == null ? '—' : (100 * baseShare).toFixed(1) + '%')
+            + (baseLegacy ? '（旧口径）' : '')),
+          h('span', { key: 'a', style: { fontWeight: 700 } }, label + ' '
+            + (share == null ? '—' : (100 * share).toFixed(1) + '%')
+            + (legacy ? '（旧口径）' : '')),
+          baseShare != null && share != null && baseLegacy === legacy ? h('span', {
+            key: 'd', style: { color: baseShare > share ? C.low : C.dim },
+          }, '差 ' + Math.abs(100 * (baseShare - share)).toFixed(1) + ' 个百分点')
+            : h('span', { key: 'd', style: { color: C.mid } }, '口径不同，不能直接相减'),
+        ]) : null,
 
         delta ? h('div', {
           key: 'delta',
@@ -562,36 +768,97 @@ window.__ModuleLoader__.load({
             padding: '6px 0', marginTop: 2,
           },
         }, [
-          h('span', { key: 'l', style: { fontSize: 11, color: C.dim } }, '改写前后'),
+          h('span', { key: 'l', style: { fontSize: 11, color: C.dim } }, '改写前后 · AI 疑似占比'),
           h('span', { key: 'b', style: { fontSize: 14, fontWeight: 600 } },
-            `${(100 * delta.before).toFixed(1)}%`),
+            (100 * Number(delta.before)).toFixed(1) + '%'),
           h('span', { key: 'a', style: { color: C.dim } }, '→'),
           h('span', {
             key: 'c',
             style: {
               fontSize: 14, fontWeight: 600,
-              color: delta.delta > 0 ? C.low : delta.delta < 0 ? C.high : C.dim,
+              color: Number(delta.delta) > 0 ? C.low : Number(delta.delta) < 0 ? C.high : C.dim,
             },
-          }, `${(100 * delta.after).toFixed(1)}%`),
-          h('span', {
+          }, (100 * Number(delta.after)).toFixed(1) + '%'),
+          Number.isFinite(Number(delta.delta)) ? h('span', {
             key: 'd',
-            style: { fontSize: 11, color: delta.delta > 0 ? C.low : delta.delta > -0.0001 ? C.dim : C.high },
-          }, `${delta.delta >= 0 ? '降' : '升'} ${Math.abs(100 * delta.delta).toFixed(1)} 个百分点`),
-          null,
+            style: { fontSize: 11, color: Number(delta.delta) > 0 ? C.low : Number(delta.delta) < -0.0001 ? C.high : C.dim },
+          }, (Number(delta.delta) >= 0 ? '降 ' : '升 ')
+            + Math.abs(100 * Number(delta.delta)).toFixed(1) + ' 个百分点')
+            : h('span', {
+              key: 'd', style: { fontSize: 11, color: C.mid },
+            }, delta.frozenBlocks === false ? '未冻结原稿块边界，不作优劣判断' : '两次结果口径不同，不作优劣判断'),
+          delta.mixedMetric ? h('span', { key: 'm', style: { fontSize: 10.5, color: C.mid } }, '旧记录需重跑') : null,
         ]) : null,
 
         r ? h('div', { key: 'score' }, [
           h('div', {
             key: 'num',
-            style: { display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 2 },
+            style: { display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 2, flexWrap: 'wrap' },
           }, [
-            h('span', { key: 'v', style: { fontSize: 26, fontWeight: 700, color: probColor, lineHeight: 1.1 } },
-              `${(100 * prob).toFixed(1)}%`),
+            h('span', { key: 'v', style: { fontSize: 26, fontWeight: 700, color: bandColor, lineHeight: 1.1 } },
+              (100 * Number(share ?? 0)).toFixed(1) + '%'),
+            h('span', {
+              key: 'band',
+              style: {
+                fontSize: 11, padding: '2px 8px', borderRadius: 999, background: C.pill, color: bandColor,
+              },
+            }, BAND_LABELS[band] || '未判档'),
             h('span', { key: 'l', style: { fontSize: 11, color: C.dim } },
-              `AI 概率 ｜ ${r.chars} 字 ｜ ${(r.segments ?? []).length} 段`),
+              label + ' · 正文 AI 疑似占比 ｜ ' + (bodyStats.chars ?? r.body_chars ?? r.chars)
+              + ' 字 ｜ ' + segments.length + ' 块 ｜ '
+              + (calibrated ? '已校准' : '未校准')),
+            current?.at ? h('span', { key: 'ts', style: { fontSize: 10.5, color: C.subtle } },
+              new Date(current.at).toLocaleTimeString()) : null,
           ]),
-          ...(r.segments ?? []).slice(0, 8).map(segRow),
-        ]) : null,
+          legacy ? h('div', {
+            key: 'legacy',
+            style: { fontSize: 10.5, color: C.mid, margin: '2px 0 4px' },
+          }, '旧口径：这里显示的是字数加权均值，不与新记录的 AI 疑似占比混算；点「检测」重跑即可迁移。') : null,
+          !calibrated ? h('div', {
+            key: 'watermark',
+            style: {
+              display: 'inline-block', margin: '3px 0 5px', padding: '2px 8px', borderRadius: 6,
+              border: '1px dashed ' + C.mid, color: C.mid, fontSize: 10.5,
+            },
+            title: 'calib.json: calibrated=false；阈值来自公开政策与少量占位样本',
+          }, '未校准 · 阈值为占位值') : null,
+          r.group_stats ? h('div', {
+            key: 'groups',
+            style: {
+              display: 'flex', gap: 6, flexWrap: 'wrap', margin: '3px 0 6px',
+              fontSize: 10.5, color: C.dim,
+            },
+          }, [
+            h('span', { key: 'b', style: { padding: '2px 7px', borderRadius: 999, background: C.pill } },
+              `正文 ${pctOrDash(r.ai_share)} / ${bodyStats.chars ?? r.body_chars ?? '—'} 字`),
+            h('span', { key: 't', style: { padding: '2px 7px', borderRadius: 999, background: C.pill } },
+              `表格 ${pctOrDash(r.table_ai_share)} / ${tableStats.chars ?? r.table_chars ?? 0} 字`),
+            h('span', { key: 'r', style: { padding: '2px 7px', borderRadius: 999, background: C.pill } },
+              `参考文献 ${pctOrDash(r.reference_ai_share)} / ${referenceStats.chars ?? r.reference_chars ?? 0} 字`),
+            h('span', { key: 'a', style: { padding: '2px 7px', borderRadius: 999, background: C.pill } },
+              `全篇 ${pctOrDash(r.all_ai_share)}`),
+            r.comparison_mode ? h('span', {
+              key: 'm', style: { padding: '2px 7px', borderRadius: 999, background: C.pill, color: C.accent },
+            }, r.comparison_mode === 'frozen' ? '冻结块比较' : '重新切块') : null,
+          ]) : null,
+          r.stability != null ? h('div', {
+            key: 'stability',
+            style: {
+              fontSize: 10.5,
+              color: Number(r.stability) > 0.06 ? C.mid : C.dim,
+              marginBottom: 4,
+            },
+          }, '切分稳定度 ' + Number(r.stability).toFixed(4) + ' · 三粒度极差'
+            + (Number(r.stability) > 0.06 ? '；结论依赖切分，建议看块级定位' : '；结论稳定')
+            + ' ｜ 块覆盖率 ' + (100 * Number(r.coverage ?? 0)).toFixed(1) + '%') : null,
+          r.degraded ? h('div', {
+            key: 'degraded', style: { fontSize: 10.5, color: C.mid, marginBottom: 4 },
+          }, '可用块不足 3 个：已退化为整篇单块打分，不输出块级定位。') : null,
+          ...segments.slice(0, 12).map(segRow),
+        ]) : h('div', {
+          key: 'noscore',
+          style: { fontSize: 11, color: C.subtle, margin: '2px 0 4px' },
+        }, '还没有对「' + label + '」跑过检测 —— 点上面按钮开始。'),
 
         d ? h('div', { key: 'diag', style: { marginTop: 9 } }, [
           h('div', {
@@ -609,12 +876,12 @@ window.__ModuleLoader__.load({
             }, `等级 ${d.level}`),
             h('span', {
               key: 'g',
-              title: `全文口径：${diag?.gateAll ? '通过' : '未通过'}（含锁定段；锁定段永不改写）`,
+              title: `全文口径：${currentDiag?.gateAll ? '通过' : '未通过'}（含锁定段；锁定段永不改写）`,
               style: {
                 fontSize: 11, padding: '2px 8px', borderRadius: 999, background: C.pill,
-                color: (diag?.gateRewritable ?? d.style_gate_passed) ? C.low : C.high,
+                color: (currentDiag?.gateRewritable ?? d.style_gate_passed) ? C.low : C.high,
               },
-            }, `语体门禁（可改写段） ${(diag?.gateRewritable ?? d.style_gate_passed) ? '通过' : '未通过'}`),
+            }, `语体门禁（可改写段） ${(currentDiag?.gateRewritable ?? d.style_gate_passed) ? '通过' : '未通过'}`),
           ]),
           h('div', {
             key: 'grid',
@@ -644,7 +911,11 @@ window.__ModuleLoader__.load({
     }
 
     // 「降 AIGC」：把 9 维痕迹诊断转成改写要求，跑完回填再用 diag/检测器复检
-    function ReduceCard({ mode, plan, check, busy, onPlan, onCheck, onNext, aigcReady = true }) {
+    function ReduceCard({
+      mode, plan, check, busy, onPlan, onCheck, onNext, aigcReady = true,
+      currentLabel = '原文', nextLabel = '改稿', currentDownloadable = true, atVersionLimit = false,
+      currentVersionId = '', currentBaseId = '', currentStatus = '', onOptimize,
+    }) {
       const isBoth = mode === 'both';
       const d = check?.diag;
       const p = check?.prob;
@@ -666,14 +937,28 @@ window.__ModuleLoader__.load({
           h('span', { key: 'sp', style: { flex: 1 } }),
           h(Btn, {
             key: 'p', onClick: onPlan, primary: true,
-            disabled: busy === 'reducePlan' || !aigcReady,
-            title: aigcReady ? '' : '先安装 torch + transformers 并完成校准',
+            disabled: busy === 'reducePlan' || !currentDownloadable || atVersionLimit,
+            title: atVersionLimit ? '最多五改，已达到上限'
+              : !currentDownloadable ? '当前版本尚未生成 docx，先完成回填'
+                : aigcReady ? `基于${currentLabel}生成${nextLabel}` : '可先按 9 维痕迹生成任务；真机 AI 疑似占比仍需安装依赖',
           },
-            busy === 'reducePlan' ? '生成中…' : (isBoth ? '生成双降任务' : '生成降 AI 任务')),
+            busy === 'reducePlan' ? '生成中…'
+              : atVersionLimit ? '最多五改'
+                : (isBoth ? `基于${currentLabel}生成${nextLabel}` : `基于${currentLabel}生成${nextLabel}`)),
+          currentStatus === 'planned' ? h(Btn, {
+            key: 'fast',
+            onClick: () => onOptimize?.({
+              baseVersionId: currentBaseId,
+              replaceVersionId: currentVersionId,
+            }),
+            disabled: busy === 'reducePlan',
+            title: '复用当前基础稿，压缩提示词和任务数；仍保存为当前版本',
+          }, busy === 'reducePlan' ? '压缩中…' : '快速压缩当前任务') : null,
           h(Btn, {
             key: 'c', onClick: onCheck,
-            disabled: busy === 'reduceCheck' || !aigcReady,
-            title: aigcReady ? '' : '真机 AIGC 依赖未安装',
+            disabled: busy === 'reduceCheck' || !currentDownloadable,
+            title: !currentDownloadable ? '当前版本还没有回填生成 docx'
+              : aigcReady ? '' : '离线复检 9 维与重复率；真机占比暂不可用',
           },
             busy === 'reduceCheck' ? '复检中…' : '复检痕迹'),
         ]),
@@ -681,18 +966,26 @@ window.__ModuleLoader__.load({
         !aigcReady ? h('div', {
           key: 'need-aigc',
           style: { fontSize: 10.5, color: C.mid, marginBottom: 7 },
-        }, '降 AI 任务与复检已锁定：先按上方步骤安装 torch + transformers，再完成模型校准。') : null,
+        }, '真机 AI 疑似占比未启用：仍可用 9 维痕迹和重复率生成/复检任务；'
+          + '安装 torch + transformers 并完成方向标定后，才会做占比验收和下一轮定向。') : null,
 
         plan ? h('div', { key: 'plan', style: { marginBottom: 8 } }, [
           h('div', { key: 'meta', style: { fontSize: 11, color: C.dim, marginBottom: 4 } },
             `第 ${plan.round || 1}/${plan.maxRounds || 3} 轮 ｜ 任务 ${plan.tasks} 段 ｜ `
             + `提示词 ${plan.prompts} 条 ｜ 要求 ${plan.hints.length} 条`
             + ` ｜ 诊断前：风险 ${plan.diagBefore.riskCount} 项 / 分数 ${plan.diagBefore.riskScore}`),
+          plan.optimization?.mode === 'focused' ? h('div', {
+            key: 'fast-mode',
+            style: { fontSize: 10.5, color: C.low, marginBottom: 4 },
+          }, `快速定向续改：任务上限 ${plan.optimization.maxTasks}，`
+            + `只锁定 ${plan.optimization.focusLimit} 个高风险段落`
+            + `${plan.optimization.detectorCached ? '；已复用上一轮逐段考官缓存' : ''}`) : null,
           plan.detectorBefore ? h('div', {
             key: 'detector-before',
             style: { fontSize: 10.5, color: C.subtle, marginBottom: 5 },
-          }, `真机逐段考官：全文 AI 概率 ${(100 * plan.detectorBefore.aiProb).toFixed(1)}% ｜ `
-            + `高于 ${plan.detectorBefore.threshold} 的 H 分段 ${plan.detectorBefore.top.length} 条`) : null,
+          }, `真机考官：正文 AI 疑似占比 ${(100 * Number(plan.detectorBefore.aiShare ?? plan.detectorBefore.aiProb)).toFixed(1)}% ｜ `
+            + `${plan.detectorBefore.calibrated ? '已校准' : '未校准'} ｜ `
+            + `高于 ${plan.detectorBefore.threshold} 的定位块 ${plan.detectorBefore.top.length} 条`) : null,
           plan.detectorError ? h('div', {
             key: 'detector-error',
             style: { fontSize: 10.5, color: C.mid, marginBottom: 5 },
@@ -740,7 +1033,7 @@ window.__ModuleLoader__.load({
             style: { fontSize: 11.5, lineHeight: 1.7, paddingLeft: 11, textIndent: -11, color: C.dim },
           }, `· ${hint}`)),
           h('div', { key: 'next', style: { fontSize: 10.5, color: C.subtle, marginTop: 4 } },
-            '下一步：让模型按 prompts.jsonl 写 edits.jsonl → 点「预检」→「回填并复检」→「三栏对照」。'),
+            '下一步：让模型按 prompts.jsonl 写 edits.jsonl → 点「预检」→「回填并 AIGC 复检」→「三栏对照」。'),
         ]) : null,
 
         d ? h('div', {
@@ -775,8 +1068,26 @@ window.__ModuleLoader__.load({
             p ? h('span', {
               key: '2',
               style: { color: 'inherit' },
-            }, `AIGC 概率 ${(100 * p.before).toFixed(1)}% → ${(100 * p.after).toFixed(1)}%`) : null,
+            }, `正文 AI 疑似占比 ${(100 * p.before).toFixed(1)}% → ${(100 * p.after).toFixed(1)}%`
+              + `${p.beforeBand || p.afterBand ? ` ｜ ${BAND_LABELS[p.beforeBand] || '未判档'} → ${BAND_LABELS[p.afterBand] || '未判档'}` : ''}`) : null,
+            p ? h('span', {
+              key: '2b',
+              style: { color: p.frozenBlocks ? C.low : C.high },
+            }, p.frozenBlocks ? '｜ 冻结块比较' : '｜ 未冻结，不能判优') : null,
           ]),
+          p ? h('div', {
+            key: 'groups-check',
+            style: { display: 'flex', gap: 9, flexWrap: 'wrap', color: C.subtle, marginTop: 3 },
+          }, [
+            h('span', { key: 'a' },
+              `全篇 ${(100 * Number(p.beforeAllShare ?? 0)).toFixed(1)}% → ${(100 * Number(p.afterAllShare ?? 0)).toFixed(1)}%`),
+            h('span', { key: 't' },
+              `表格 ${p.beforeTableShare == null ? '—' : `${(100 * p.beforeTableShare).toFixed(1)}%`} → `
+              + `${p.afterTableShare == null ? '—' : `${(100 * p.afterTableShare).toFixed(1)}%`}`),
+            h('span', { key: 'r' },
+              `参考文献 ${p.beforeReferenceShare == null ? '—' : `${(100 * p.beforeReferenceShare).toFixed(1)}%`} → `
+              + `${p.afterReferenceShare == null ? '—' : `${(100 * p.afterReferenceShare).toFixed(1)}%`}`),
+          ]) : null,
           (check.pacing && check.pacing.after != null) ? h('div', {
             key: 'pac', style: { display: 'flex', gap: 10, flexWrap: 'wrap', color: C.dim, marginTop: 3 },
           }, [
@@ -817,18 +1128,36 @@ window.__ModuleLoader__.load({
             h(Btn, {
               key: 'b',
               onClick: () => onNext?.(check.nextRound),
-              disabled: busy === 'reducePlan',
-            }, busy === 'reducePlan' ? '生成中…' : '按考官结果生成下一轮'),
+              disabled: busy === 'reducePlan' || atVersionLimit,
+            }, busy === 'reducePlan' ? '生成中…' : atVersionLimit ? '最多五改' : '按考官结果生成下一轮'),
           ]) : check.nextRound?.ready === false && !check.acceptance?.accepted ? h('div', {
             key: 'next-offline',
             style: { marginTop: 5, fontSize: 10.5, color: C.subtle },
-          }, '自动定向下一轮需要真机 transformers + torch，且必须完成校准。') : null,
+          }, '自动定向下一轮需要真机 transformers + torch，且必须完成标签方向标定。') : null,
         ]) : null,
 
         !plan && !d ? h('div', {
           key: 'empty', style: { fontSize: 11, color: C.dim, lineHeight: 1.7 },
         }, '点「生成降 AI 任务」：插件先跑 9 维诊断（离线可用），把结论写成改写要求注入每条提示词，'
-          + '模型改完回填后，再点「复检痕迹」看风险项与分数是否下降。') : null,
+          + '模型改完回填时会自动做冻结块 AIGC 复检；「复检痕迹」可手动重跑完整证据。') : null,
+      ]);
+    }
+
+    function AigcDisclaimers() {
+      const rows = [
+        '主数字只统计可改写正文；表格和参考文献在旁边单列，不并入正文主指标。',
+        '版本前后对比使用基础稿冻结块；未显示“冻结块比较”的数字不能用于判断改好或改坏。',
+        '所有数字都是本工具自有口径且尚未充分校准，不能与任何第三方平台横比，也不作为通过依据。',
+      ];
+      return h('div', {
+        style: {
+          border: '1px solid ' + C.mid, borderRadius: 9, padding: '9px 11px',
+          background: 'rgba(245,165,36,0.06)', fontSize: 10.8,
+          lineHeight: 1.72, color: C.dim,
+        },
+      }, [
+        h('div', { key: 'h', style: { color: C.mid, fontWeight: 650, marginBottom: 3 } }, '使用边界（固定说明）'),
+        ...rows.map((text, i) => h('div', { key: i }, (i + 1) + '. ' + text)),
       ]);
     }
 
@@ -840,9 +1169,9 @@ window.__ModuleLoader__.load({
         bullets: ['离线可验：重复率前后对比', '不联网、不装模型', '改完 Word 格式零漂移'],
       },
       {
-        id: 'aigc', title: '降低 AIGC 率', tag: '降 AI',
+        id: 'aigc', title: '降低 AI 疑似占比', tag: '降 AI',
         desc: '9 维痕迹诊断（模板套话/被动/句长/对称/嵌套/冒号/标点/口语/破折号）→ 写进提示词 → 改写回填。',
-        bullets: ['离线：9 维风险项与分数可验', '真机：逐段概率定位下一轮', '不达标自动回退'],
+        bullets: ['离线：9 维风险项与分数可验', '真机：按块贡献度定位下一轮', '不达标自动回退'],
       },
       {
         id: 'both', title: '双降', tag: '降重 + 降 AI',
@@ -859,11 +1188,11 @@ window.__ModuleLoader__.load({
         }, [
           h('div', { key: '1' }, '先填论文路径并诊断，再选一个模式进入对应工作流。'),
           h('div', { key: '2', style: { fontSize: 11 } },
-            '把 .docx 直接拖进这个面板也行；也可以点下面输入框右侧的「诊断」用路径。'),
+            '把 .doc / .docx 直接拖进这个面板也行；.doc 会自动转成 docx，原文件不动。'),
         ]),
         h('div', { key: 'input', style: { display: 'flex', gap: 8, alignItems: 'center' } }, [
           h('input', {
-            key: 'p', value: docPath, placeholder: '论文 .docx 的绝对路径（只读，不改原文件）',
+            key: 'p', value: docPath, placeholder: '论文 .doc 或 .docx 的绝对路径（只读，不改原文件）',
             onChange: (e) => onPath(e.target.value),
             onKeyDown: (e) => { if (e.key === 'Enter') onDiagnose(); },
             style: {
@@ -927,7 +1256,12 @@ window.__ModuleLoader__.load({
           `| 语体门禁 | ${d.before.gate ? '通过' : '未通过'} | ${d.after.gate ? '通过' : '未通过'} |`,
         );
         if (p) {
-          lines.push(`| AIGC 概率 | ${(100 * p.before).toFixed(1)}% | ${(100 * p.after).toFixed(1)}% |`);
+          lines.push(`| 正文 AI 疑似占比 | ${(100 * p.before).toFixed(1)}% | ${(100 * p.after).toFixed(1)}% |`);
+          lines.push(`| 档位 | ${BAND_LABELS[p.beforeBand] || '未判档'} | ${BAND_LABELS[p.afterBand] || '未判档'} |`);
+          lines.push(`| 全篇 AI 疑似占比 | ${(100 * Number(p.beforeAllShare ?? 0)).toFixed(1)}% | ${(100 * Number(p.afterAllShare ?? 0)).toFixed(1)}% |`);
+          lines.push(`| 表格 AI 疑似占比 | ${p.beforeTableShare == null ? '—' : `${(100 * p.beforeTableShare).toFixed(1)}%`} | ${p.afterTableShare == null ? '—' : `${(100 * p.afterTableShare).toFixed(1)}%`} |`);
+          lines.push(`| 参考文献 AI 疑似占比 | ${p.beforeReferenceShare == null ? '—' : `${(100 * p.beforeReferenceShare).toFixed(1)}%`} | ${p.afterReferenceShare == null ? '—' : `${(100 * p.afterReferenceShare).toFixed(1)}%`} |`);
+          lines.push(`| 块边界 | ${p.beforeComparisonMode === 'frozen' ? '冻结' : '重切'} | ${p.comparisonMode === 'frozen' ? '冻结' : '重切'} |`);
         }
         if (check?.acceptance) {
           lines.push('', `- 复检验收：${check.acceptance.accepted ? '通过' : '未通过'}`);
@@ -945,7 +1279,10 @@ window.__ModuleLoader__.load({
       }
       if (apply?.verdict) {
         lines.push('', `- 改写接受 ${apply.apply?.applied ?? '—'} 段 / 拒绝 ${apply.apply?.rejected ?? '—'} 段`);
-        lines.push(`- 篇级复检：${apply.verdict.passed ? '通过' : '未通过（已整篇回退）'}｜字数 ${apply.verdict.chars[0]}→${apply.verdict.chars[1]}`);
+        lines.push(`- 篇级复检：${
+          apply.noop ? '格式通过但 0 段实际改写'
+            : apply.verdict.passed ? '通过' : '未通过（已整篇回退）'
+        }｜字数 ${apply.verdict.chars[0]}→${apply.verdict.chars[1]}`);
       }
       return lines.join('\n');
     }
@@ -1060,9 +1397,10 @@ window.__ModuleLoader__.load({
       const [mode, setMode] = useState(null);
       const [report, setReport] = useState(null);
       const [aigc, setAigc] = useState(null);
-      const [aigcTarget, setAigcTarget] = useState('original');
-      const [aigcScoreRes, setAigcScoreRes] = useState(null);
-      const [aigcDiagRes, setAigcDiagRes] = useState(null);
+      const [activeVersionId, setActiveVersionId] = useState('original');
+      // 原文和改稿各一份，切 tab 时显示各自结果。
+      const [aigcScores, setAigcScores] = useState({});
+      const [aigcDiags, setAigcDiags] = useState({});
       const [aigcDeltaRes, setAigcDeltaRes] = useState(null);
       const [reducePlanRes, setReducePlanRes] = useState(null);
       const [reduceCheckRes, setReduceCheckRes] = useState(null);
@@ -1074,14 +1412,26 @@ window.__ModuleLoader__.load({
       const [pyInput, setPyInput] = useState('');
       const [hfInput, setHfInput] = useState('');
       const [showSetup, setShowSetup] = useState(false);
+      const [editsBox, setEditsBox] = useState('');
+      const [showEdits, setShowEdits] = useState(false);
+      const editsCheck = useMemo(() => parseEditsText(editsBox), [editsBox]);
       const alive = useRef(true);
       const busyRef = useRef(false);
       const savedModeRef = useRef('');
+      const runKeyRef = useRef('');
+      const versionRef = useRef('original');
 
       useEffect(() => () => { alive.current = false; }, []);
 
       const applyStatus = useCallback((s) => {
         setStatus(s);
+        const nextRunKey = s?.lastRun?.key || s?.lastRun?.outdir || '';
+        const runChanged = nextRunKey !== runKeyRef.current;
+        runKeyRef.current = nextRunKey;
+        const nextVersionId = s?.activeVersionId || 'original';
+        const versionChanged = nextVersionId !== versionRef.current;
+        versionRef.current = nextVersionId;
+        setActiveVersionId(nextVersionId);
         if (s?.lastRun) {
           setResult((prev) => (
             prev
@@ -1103,6 +1453,17 @@ window.__ModuleLoader__.load({
         setApply(s?.lastApply ?? null);
         setReducePlanRes(s?.lastReduce ?? null);
         setReduceCheckRes(s?.lastReduceCheck ?? null);
+        // 服务端已经按当前文档分好 key；直接替换，避免上一篇的 tab 结果串进来。
+        setAigcScores(s?.aigc?.byTarget ?? {});
+        setAigcDiags(s?.aigc?.diagByTarget ?? {});
+        if (runChanged || versionChanged) {
+          setAigcDeltaRes(null);
+          setLint(null);
+          setRows(null);
+          setReport(null);
+          setEditsBox('');
+          setShowEdits(false);
+        }
       }, []);
 
       const refresh = useCallback(async () => {
@@ -1152,6 +1513,15 @@ window.__ModuleLoader__.load({
         }
       }, []);
 
+      const selectVersion = useCallback((versionId) => wrapBusy('version', async () => {
+        if (!versionId || versionId === activeVersionId) return;
+        const r = await postJson(`${PREFIX}/versions/select`, { versionId });
+        if (!alive.current) return;
+        if (!r.ok) { setError(r.error || '切换版本失败'); return; }
+        applyStatus(r);
+        setMsg(`已切换到 ${r.activeVersion?.label || versionId}；下方任务、复检和下载已同步刷新`);
+      }), [activeVersionId, applyStatus, wrapBusy]);
+
       const enterMode = useCallback((m) => {
         savedModeRef.current = m;
         setMode(m);
@@ -1176,15 +1546,19 @@ window.__ModuleLoader__.load({
         setDragOver(false);
         const f = e.dataTransfer?.files?.[0];
         if (!f) return;
-        if (!/\.docx$/i.test(f.name)) {
-          setError('只支持 .docx（.doc 请先在 Word 里另存为 .docx）');
+        if (!/\.(docx|doc)$/i.test(f.name)) {
+          setError(`只收 Word 文档（.doc / .docx），拖进来的是 ${(f.name.split('.').pop() || '未知')}。`
+            + 'PDF 请先转成 Word。');
           return;
         }
+        const note = /\.doc$/i.test(f.name)
+          ? '（.doc 会在宿主侧自动转成 .docx，原文件不改动）'
+          : '';
         const p = f.path;
         if (p && /[\\/]/.test(p)) {
           setError('');
           setDocPath(p);
-          setMsg(`已接收：${f.name}（路径已填入，点「诊断」开始）`);
+          setMsg(`已接收：${f.name}${note}（路径已填入，点「诊断」开始）`);
           try { localStorage.setItem('dsh-paper-dual:doc', p); } catch { /* ignore */ }
           return;
         }
@@ -1197,7 +1571,7 @@ window.__ModuleLoader__.load({
           if (!r.ok) { setError(`接收文件失败：${r.error}`); return; }
           setError('');
           setDocPath(r.path);
-          setMsg(`已接收：${f.name} → ${r.path}（点「诊断」开始）`);
+          setMsg(`已接收：${f.name}${note}（点「诊断」开始）`);
           try { localStorage.setItem('dsh-paper-dual:doc', r.path); } catch { /* ignore */ }
         };
         reader.readAsDataURL(f);
@@ -1205,21 +1579,22 @@ window.__ModuleLoader__.load({
 
       const runDiagnose = useCallback(() => wrapBusy('diagnose', async () => {
         const p = String(docPath || '').trim();
-        if (!p) { setError('先填论文 .docx 的绝对路径'); return; }
+        if (!p) { setError('先填论文 .doc 或 .docx 的绝对路径'); return; }
         const r = await postJson(`${PREFIX}/diagnose`, { path: p });
         if (!alive.current) return;
         if (!r.ok) { setError(`${r.error}${r.hint ? `（${r.hint}）` : ''}`); return; }
         setResult(r);
         setTasks(null); setLint(null); setApply(null); setRows(null); setReport(null);
-        setAigcScoreRes(null); setAigcDiagRes(null); setAigcDeltaRes(null);
+        setAigcScores({}); setAigcDiags({}); setAigcDeltaRes(null);
         setReducePlanRes(null); setReduceCheckRes(null); setOpen('');
-        setMsg('诊断完成');
+        setEditsBox(''); setShowEdits(false);
+        setMsg(`诊断完成${r.converted ? '（已把 .doc 转成 docx 再解析，原文件未改动）' : ''}`);
         try { localStorage.setItem('dsh-paper-dual:doc', r.docPath || p); } catch { /* ignore */ }
         refresh();
       }), [docPath, refresh, wrapBusy]);
 
       const runTasks = useCallback(() => wrapBusy('tasks', async () => {
-        const r = await postJson(`${PREFIX}/rewrite`, {});
+        const r = await postJson(`${PREFIX}/rewrite`, { baseVersionId: activeVersionId });
         if (!alive.current) return;
         if (!r.ok) { setError(r.error); return; }
         setTasks(r);
@@ -1228,7 +1603,7 @@ window.__ModuleLoader__.load({
         setReport(null);
         setMsg(`已生成 ${r.tasks} 段任务 / ${r.prompts} 条提示词`);
         refresh();
-      }), [refresh, wrapBusy]);
+      }), [activeVersionId, refresh, wrapBusy]);
 
       const runLintNow = useCallback(() => wrapBusy('lint', async () => {
         const r = await postJson(`${PREFIX}/lint`, {});
@@ -1239,34 +1614,108 @@ window.__ModuleLoader__.load({
       }), [wrapBusy]);
 
       const runApplyNow = useCallback(() => wrapBusy('apply', async () => {
-        const r = await postJson(`${PREFIX}/apply`, {});
+        const applyScope = mode === 'dedupe' ? 'dedupe' : mode === 'both' ? 'both' : 'aigc';
+        const r = await postJson(`${PREFIX}/apply`, { scope: applyScope });
         if (!alive.current) return;
         if (!r.ok) { setError(r.error); return; }
         setApply(r);
-        setReduceCheckRes(null);
+        setReduceCheckRes(r.mandatoryCheck?.ok ? r.mandatoryCheck : null);
         setReport(null);
         setLint(r.lint ? { counts: r.lint, rejected: lint?.rejected ?? [] } : lint);
-        setMsg(r.verdict?.passed ? '回填并复检通过' : '复检未通过，已按规则处理');
+        setMsg(r.noop
+          ? `没有一段被改写（拒绝 ${r.apply?.rejected ?? 0} 条，原因见下）；这不叫复检通过`
+          : r.mandatoryCheck && !r.mandatoryCheck.acceptance?.accepted
+            ? `AIGC 复检未通过：${r.mandatoryCheck.acceptance?.failed?.join('、') || '模型指标恶化'}`
+              + `${r.mandatoryCheck.rollback?.performed ? '；已回退' : ''}`
+            : r.verdict?.passed
+              ? (mode === 'dedupe' ? '回填及结构复检通过' : '回填及冻结块 AIGC 复检通过')
+              : '复检未通过，已按规则处理');
         const cmp = await getJson(`${PREFIX}/compare`);
         if (alive.current && cmp?.ok) setRows(cmp.rows ?? []);
         refresh();
-      }), [lint, refresh, wrapBusy]);
+      }), [lint, mode, refresh, wrapBusy]);
+
+      const runLintWithText = useCallback(() => wrapBusy('lint', async () => {
+        const text = String(editsBox || '').trim();
+        if (!text) {
+          setShowEdits(true);
+          setError('先把 edits.jsonl 的内容贴进「手动贴清单」框，再点这里');
+          return;
+        }
+        const r = await postJson(`${PREFIX}/lint`, { edits: text });
+        if (!alive.current) return;
+        if (!r.ok) { setError(r.error); return; }
+        setLint(r);
+        setMsg(`预检：可通过 ${r.counts?.would_apply ?? 0} ｜ 会被拒 ${r.counts?.would_reject ?? 0}`);
+        refresh();
+      }), [editsBox, refresh, wrapBusy]);
+
+      const runApplyWithText = useCallback(() => wrapBusy('apply', async () => {
+        const text = String(editsBox || '').trim();
+        if (!text) {
+          setShowEdits(true);
+          setError('先把 edits.jsonl 的内容贴进「手动贴清单」框，再点这里');
+          return;
+        }
+        const applyScope = mode === 'dedupe' ? 'dedupe' : mode === 'both' ? 'both' : 'aigc';
+        const r = await postJson(`${PREFIX}/apply`, { edits: text, scope: applyScope });
+        if (!alive.current) return;
+        if (!r.ok) { setError(r.error); return; }
+        setApply(r);
+        setLint(r.lint ? { counts: r.lint, rejected: [] } : lint);
+        setReduceCheckRes(r.mandatoryCheck?.ok ? r.mandatoryCheck : null);
+        setReport(null);
+        setMsg(r.noop
+          ? `没有一段被改写（拒绝 ${r.apply?.rejected ?? 0} 条）；原因见下方「复检结论」`
+          : r.mandatoryCheck && !r.mandatoryCheck.acceptance?.accepted
+            ? `AIGC 复检未通过：${r.mandatoryCheck.acceptance?.failed?.join('、') || '模型指标恶化'}`
+              + `${r.mandatoryCheck.rollback?.performed ? '；已回退' : ''}`
+            : r.verdict?.passed
+              ? (mode === 'dedupe' ? '回填及结构复检通过' : '回填及冻结块 AIGC 复检通过')
+              : '复检未通过，已按规则处理');
+        const cmp = await getJson(`${PREFIX}/compare`);
+        if (alive.current && cmp?.ok) setRows(cmp.rows ?? []);
+        refresh();
+      }), [editsBox, lint, mode, refresh, wrapBusy]);
+
+      const loadEditsFile = useCallback(() => wrapBusy('loadEdits', async () => {
+        const r = await getJson(`${PREFIX}/edits`);
+        if (!alive.current) return;
+        if (!r?.ok) { setError(r?.error ?? '读不到编辑清单'); return; }
+        setEditsBox(r.text || '');
+        setShowEdits(true);
+        setMsg(r.exists ? '已读回这篇文档目录里的 edits.jsonl' : '这篇文档还没有 edits.jsonl（框里是空的）');
+      }), [wrapBusy]);
+
+      const saveEditsToFile = useCallback(() => wrapBusy('saveEdits', async () => {
+        if (!editsCheck.ok) { setShowEdits(true); return; }
+        const r = await postJson(`${PREFIX}/edits`, { text: String(editsBox).trim() });
+        if (!alive.current) return;
+        if (!r.ok) { setError(r.error ?? '保存清单失败'); return; }
+        // 不等下一次网络刷新，先把“已有清单”状态点亮，避免按钮看起来仍锁着。
+        setStatus((prev) => (prev ? { ...prev, hasEdits: true } : prev));
+        setMsg(`已保存 ${r.lines} 条清单到 edits.jsonl`
+          + `（编号对不上的 ${r.counts?.unknown ?? 0} 条）—— 「预检 / 回填并 AIGC 复检」已解锁`);
+        refresh();
+      }), [editsCheck, editsBox, refresh, wrapBusy]);
 
       const runAigcScore = useCallback(() => wrapBusy('aigcScore', async () => {
-        const r = await postJson(`${PREFIX}/aigc/score`, { target: aigcTarget });
+        const r = await postJson(`${PREFIX}/aigc/score`, { versionId: activeVersionId });
         if (!alive.current) return;
         if (!r.ok) { setError(r.error); return; }
-        setAigcScoreRes(r);
-        setMsg('AIGC 打分完成（真机）');
-      }), [aigcTarget, wrapBusy]);
+        const key = r.target === 'inline' ? activeVersionId : r.target;
+        setAigcScores((prev) => ({ ...prev, [key]: r }));
+        setMsg(`${key === 'original' ? '原文' : key} 打分完成（真机）`);
+      }), [activeVersionId, wrapBusy]);
 
       const runAigcDiag = useCallback(() => wrapBusy('aigcDiag', async () => {
-        const r = await postJson(`${PREFIX}/aigc/diag`, { target: aigcTarget });
+        const r = await postJson(`${PREFIX}/aigc/diag`, { versionId: activeVersionId });
         if (!alive.current) return;
         if (!r.ok) { setError(r.error); return; }
-        setAigcDiagRes(r);
+        const key = r.target === 'inline' ? activeVersionId : r.target;
+        setAigcDiags((prev) => ({ ...prev, [key]: r }));
         setMsg(`9 维诊断完成：风险 ${r.result?.risk_count ?? 0} 项 ｜ 等级 ${r.result?.level ?? '—'}`);
-      }), [aigcTarget, wrapBusy]);
+      }), [activeVersionId, wrapBusy]);
 
       const runSelftest = useCallback(() => wrapBusy('selftest', async () => {
         const r = await postJson(`${PREFIX}/aigc/selftest`, {});
@@ -1286,21 +1735,24 @@ window.__ModuleLoader__.load({
       }), [refresh, wrapBusy]);
 
       const runDelta = useCallback(() => wrapBusy('aigcDelta', async () => {
-        const r = await postJson(`${PREFIX}/aigc/delta`, {});
+        const r = await postJson(`${PREFIX}/aigc/delta`, { versionId: activeVersionId });
         if (!alive.current) return;
         if (!r.ok) { setError(r.error); return; }
         setAigcDeltaRes(r);
         setMsg(`前后对比：${(100 * r.before).toFixed(1)}% → ${(100 * r.after).toFixed(1)}%`);
-      }), [wrapBusy]);
+        refresh();
+      }), [activeVersionId, refresh, wrapBusy]);
 
       const runReducePlan = useCallback((override) => wrapBusy('reducePlan', async () => {
         const request = override && !override.nativeEvent ? override : {};
         const scope = request.scope || (mode === 'both' ? 'both' : 'aigc');
         const r = await postJson(`${PREFIX}/reduce/plan`, {
           scope,
+          baseVersionId: request.baseVersionId || activeVersionId,
+          replaceVersionId: request.replaceVersionId,
           focusPids: request.focusPids,
           maxRounds: request.maxRounds,
-          useDetector: request.useDetector,
+          useDetector: request.useDetector ?? (aigc?.detectorReady !== false),
         });
         if (!alive.current) return;
         if (!r.ok) { setReducePlanRes(null); setError(r.error); return; }
@@ -1309,10 +1761,11 @@ window.__ModuleLoader__.load({
         setRows(null);
         setReport(null);
         const opText = Object.entries(r.opCount ?? {}).map(([k, v]) => `${k}×${v}`).join(' ');
-        setMsg(`第 ${r.round} 轮已生成${r.scope === 'both' ? '双降' : '降 AI'}任务：`
+        setMsg(`${r.optimization?.reusedVersion ? '当前版本已快速重建' : `第 ${r.round} 轮已生成`}`
+          + `${r.scope === 'both' ? '双降' : '降 AI'}任务：`
           + `${r.tasks} 段 / ${r.prompts} 条提示词 ｜ 算子 ${opText}`);
         refresh();
-      }), [mode, refresh, wrapBusy]);
+      }), [activeVersionId, aigc, mode, refresh, wrapBusy]);
 
       const runReduceCheck = useCallback(() => wrapBusy('reduceCheck', async () => {
         const r = await postJson(`${PREFIX}/reduce/check`, { autoRollback: true });
@@ -1325,7 +1778,7 @@ window.__ModuleLoader__.load({
           ? `复检达标：风险 ${r.diag.before.riskCount}→${r.diag.after.riskCount} ｜ `
             + `分数 ${r.diag.before.riskScore}→${r.diag.after.riskScore}`
           : `复检未达标：${r.acceptance?.failed?.join('、') || '指标恶化'}`
-            + `${r.rollback?.performed ? '；已回退到上一版' : ''}`);
+            + `${r.rollback?.performed ? '；本版仍保留可下载，可切回基础稿或继续作为下一轮输入' : ''}`);
         refresh();
       }), [refresh, wrapBusy]);
 
@@ -1365,6 +1818,20 @@ window.__ModuleLoader__.load({
       const top = useMemo(() => s?.top ?? [], [s]);
       const stats = s?.stats ?? {};
       const verdict = apply?.verdict;
+      const versions = status?.versions ?? [];
+      const currentVersion = versions.find((v) => v.id === activeVersionId)
+        ?? versions.find((v) => v.id === status?.activeVersionId)
+        ?? versions[0]
+        ?? null;
+      const baseVersion = currentVersion?.baseId
+        ? versions.find((v) => v.id === currentVersion.baseId) ?? null
+        : null;
+      const currentVersionLabel = currentVersion?.label || '原文';
+      const currentBaseLabel = baseVersion?.label || '原文';
+      const nextVersionLabel = versionLabelForIndex((currentVersion?.index || 0) + 1);
+      const atVersionLimit = (currentVersion?.index || 0) >= 5;
+      const canStageEdits = canStageEditsFor(currentVersion);
+      const currentCanApply = Boolean(status?.hasEdits) && canStageEdits;
 
       const wrap = {
         display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0,
@@ -1450,7 +1917,7 @@ window.__ModuleLoader__.load({
           h('div', { key: 't', style: { color: C.mid, fontWeight: 650, marginBottom: 3 } },
             'AIGC 考官尚未启用：缺少 torch + transformers'),
           h('div', { key: 'd' },
-            '插件不会显示伪概率。可复制安装命令到 PowerShell，装完在「设置」填入解释器和模型缓存，再点「校准」。'),
+            '插件不会显示伪造分数。可复制安装命令到 PowerShell，装完在「设置」填入解释器和模型缓存，再点「方向标定」。'),
           h('div', { key: 'b', style: { display: 'flex', gap: 8, marginTop: 7, flexWrap: 'wrap' } }, [
             h(Btn, {
               key: 'cp', onClick: () => copy('dep-install', aigc.setup?.installScript || ''),
@@ -1494,9 +1961,25 @@ window.__ModuleLoader__.load({
           style: {
             padding: '8px 10px', border: `1px solid ${C.high}`, borderRadius: 8,
             color: C.high, fontSize: 12, whiteSpace: 'pre-wrap',
+            position: 'sticky', top: 8, zIndex: 30, background: C.card,
+            backdropFilter: 'blur(8px)', boxShadow: '0 4px 14px rgba(0,0,0,0.10)',
           },
         }, error) : null,
-        msg ? h('div', { key: 'msg', style: { fontSize: 12, color: C.dim } }, msg) : null,
+        (msg && !error) ? h('div', {
+          key: 'msg',
+          style: {
+            fontSize: 12, color: C.dim, padding: '7px 9px', borderRadius: 8,
+            background: C.card, border: `1px solid ${C.border}`,
+          },
+        }, msg) : null,
+        status?.docChanged ? h('div', {
+          key: 'doc-changed',
+          style: {
+            padding: '8px 10px', border: `1px solid ${C.mid}`, borderRadius: 8,
+            color: C.mid, fontSize: 11.5, lineHeight: 1.7,
+          },
+        }, '原文件在诊断之后被修改或替换了：当前 doc.json、段落编号和 edits.jsonl 已经过期。'
+          + '请先重新诊断，再生成新一轮任务；不要继续拿旧清单回填。') : null,
 
         mode && s ? h('div', { key: 'result', style: { display: 'flex', flexDirection: 'column', gap: 10 } }, [
           // 概览
@@ -1524,6 +2007,14 @@ window.__ModuleLoader__.load({
             ]),
           ]),
 
+          h(VersionBar, {
+            key: 'versions',
+            versions,
+            target: activeVersionId,
+            onTarget: selectVersion,
+            busy,
+          }),
+
           // Top 段落（降 AI 模式看的是 9 维痕迹，不是六维段落表）
           mode !== 'aigc' && top.length ? h('div', { key: 'top' }, [
             h('div', { key: 'h', style: sectionLabel }, `高风险段落（前 ${top.length}，点开看原文）`),
@@ -1538,19 +2029,24 @@ window.__ModuleLoader__.load({
               key: 'legend',
               style: { fontSize: 11, color: C.dim, marginTop: 6, lineHeight: 1.7 },
             }, '风险分是篇内相对指标（0–1）：高 ≥ 0.62 ／ 中 ≥ 0.45 ／ 低 < 0.45；'
-              + '不是百分比，也不是任何平台的检测概率。字数指该段中文字符数。'),
+              + '不是任何平台的检测数值。字数指该段中文字符数。'),
           ]) : null,
 
           // AIGC 考官（模型检测 + 9 维痕迹；降重模式不显示）
           mode !== 'dedupe' && h(AigcCard, {
             key: 'aigc',
             status: aigc,
-            score: aigcScoreRes,
-            diag: aigcDiagRes,
+            scores: aigcScores,
+            diags: aigcDiags,
             delta: aigcDeltaRes,
             aiLabel: aigc?.aiLabel ?? null,
-            target: aigcTarget,
-            onTarget: setAigcTarget,
+            target: activeVersionId,
+            versionLabel: currentVersionLabel,
+            baseLabel: currentBaseLabel,
+            baseId: baseVersion?.id || null,
+            canRewrite: Boolean(currentVersion?.downloadable),
+            versions,
+            onTarget: selectVersion,
             onScore: runAigcScore,
             onDiag: runAigcDiag,
             onSelftest: runSelftest,
@@ -1572,6 +2068,14 @@ window.__ModuleLoader__.load({
             onCheck: runReduceCheck,
             onNext: runReducePlan,
             aigcReady: aigc?.detectorReady !== false,
+            currentLabel: currentVersionLabel,
+            nextLabel: nextVersionLabel,
+            currentDownloadable: Boolean(currentVersion?.downloadable),
+            atVersionLimit,
+            currentVersionId: currentVersion?.id || '',
+            currentBaseId: currentVersion?.baseId || 'original',
+            currentStatus: currentVersion?.status || '',
+            onOptimize: runReducePlan,
           }),
 
           // 闭环步骤（三模式共用同一条流水线，只是任务来源不同）
@@ -1585,7 +2089,8 @@ window.__ModuleLoader__.load({
             h('div', { key: 'row', style: { display: 'flex', gap: 14, flexWrap: 'wrap', marginBottom: 9 } }, [
               h(Step, {
                 key: '1', n: 1,
-                title: mode === 'dedupe' ? '生成任务' : '生成降 AI 任务',
+                title: atVersionLimit ? '已达五改上限'
+                  : mode === 'dedupe' ? `生成${nextVersionLabel}` : `生成${nextVersionLabel}降 AI 任务`,
                 active: true, done: Boolean(tasks) || Boolean(reducePlanRes),
               }),
               h(Step, { key: '2', n: 2, title: '预检', done: Boolean(lint) }),
@@ -1604,26 +2109,135 @@ window.__ModuleLoader__.load({
               }, status?.hasEdits ? 'edits.jsonl 已写入' : 'edits.jsonl 未写入'),
               h('span', {
                 key: '4',
-                style: { color: verdict ? (verdict.passed ? C.low : C.high) : C.dim },
-              }, verdict ? (verdict.passed ? '已回填，复检通过' : '复检未过，已整篇回退') : '尚未回填'),
+                style: {
+                  color: verdict
+                    ? (apply?.noop ? C.mid : verdict.passed ? C.low : C.high)
+                    : C.dim,
+                },
+              }, verdict
+                ? (apply?.noop ? '格式通过，但 0 段实际改写'
+                  : verdict.passed ? '已回填，复检通过' : '复检未过，已整篇回退')
+                : '尚未回填'),
             ]),
             h('div', { key: 'btns', style: { display: 'flex', gap: 8, flexWrap: 'wrap' } }, [
               mode === 'dedupe' && h(Btn, {
-                key: 't', onClick: runTasks, disabled: busy === 'tasks',
-              }, busy === 'tasks' ? '生成中…' : '生成改写任务'),
-              h(Btn, { key: 'l', onClick: runLintNow, disabled: busy === 'lint' || !status?.hasEdits },
-                busy === 'lint' ? '预检中…' : '预检'),
+                key: 't', onClick: runTasks,
+                disabled: busy === 'tasks' || !currentVersion?.downloadable || atVersionLimit,
+                title: atVersionLimit ? '最多五改，已达到上限'
+                  : currentVersion?.downloadable
+                    ? `基于${currentVersionLabel}生成${nextVersionLabel}`
+                    : '当前版本尚未生成 docx，先完成回填',
+              }, busy === 'tasks' ? '生成中…'
+                : atVersionLimit ? '最多五改' : `基于${currentVersionLabel}生成${nextVersionLabel}`),
+              h(Btn, {
+                key: 'l', onClick: runLintNow,
+                disabled: busy === 'lint' || !currentCanApply || status?.docChanged,
+                title: status?.docChanged
+                  ? '原文件已变化：先重新诊断'
+                  : currentCanApply ? '只跑闸门，不写文件'
+                    : '还没有 edits.jsonl —— 先让模型写，或手动贴清单',
+              }, busy === 'lint' ? '预检中…' : '预检'),
               h(Btn, {
                 key: 'a', onClick: runApplyNow, primary: true,
-                disabled: busy === 'apply' || !status?.hasEdits,
-              }, busy === 'apply' ? '回填中…' : '回填并复检'),
+                disabled: busy === 'apply' || !currentCanApply || status?.docChanged,
+                title: status?.docChanged
+                  ? '原文件已变化：先重新诊断'
+                  : currentCanApply ? '写改稿并保存为当前版本'
+                    : '当前版本已完成，先生成下一轮任务，或切到待回填版本',
+              }, busy === 'apply' ? '回填中…'
+                : mode === 'dedupe' ? '回填并结构复检' : '回填并 AIGC 复检'),
               h(Btn, { key: 'c', onClick: loadCompare, disabled: busy === 'cmp' }, '三栏对照'),
               h(Btn, { key: 'r', onClick: loadReport }, report ? '收起报告' : '查看报告'),
             ]),
-            tasks ? h(InstructionCard, {
-              key: 'instr', tasks, copied: copied === 'instr',
-              onCopy: () => copy('instr', tasks.instruction),
+            (tasks || reducePlanRes?.tasks) ? h(InstructionCard, {
+              key: 'instr', copied: copied === 'instr',
+              tasks: tasks ?? reducePlanRes,
+              onCopy: () => copy('instr', (tasks ?? reducePlanRes).instruction ?? ''),
             }) : null,
+
+            (!currentCanApply || status?.docChanged) ? h('div', {
+              key: 'lockinfo',
+              style: {
+                marginTop: 8, padding: '7px 9px', border: `1px dashed ${C.border}`,
+                borderRadius: 8, fontSize: 11, color: C.dim, lineHeight: 1.7, background: C.code,
+              },
+            }, [
+              h('div', { key: 'h', style: { color: C.mid, fontWeight: 600, marginBottom: 2 } },
+                status?.docChanged ? '为什么按钮是灰的：原文件已变化'
+                  : (currentVersion?.status === 'applied' || currentVersion?.status === 'rejected')
+                    ? '当前版本已完成，请生成下一版' : '「预检 / 回填并 AIGC 复检」为什么是灰的'),
+              h('div', { key: '1' },
+                status?.docChanged
+                  ? '诊断后原文件又被修改了，旧 doc.json 的段落编号可能对不上，必须先重新诊断。'
+                  : (currentVersion?.status === 'applied' || currentVersion?.status === 'rejected')
+                    ? `「${currentVersionLabel}」已经保存成独立版本；直接在上一张卡生成 ${nextVersionLabel}。`
+                    : '这两个按钮要读当前版本目录里的 edits.jsonl；它还没写入时锁住，避免拿旧清单复检造成假失败。'),
+              h('div', { key: '2' },
+                status?.docChanged
+                  ? '重新诊断后，再生成任务或重新贴清单。'
+                  : '解锁两条路：① 把「改写指令」发给模型，让它写清单；② 直接贴进下面的「手动贴清单」。'),
+            ]) : null,
+
+            h('div', { key: 'paste', style: { marginTop: 9 } }, [
+              h('div', { key: 'h', style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } }, [
+                h(Btn, { key: 'tg', onClick: () => setShowEdits((x) => !x) },
+                  showEdits ? '收起「手动贴清单」' : '手动贴清单（JSONL）'),
+                editsCheck.ok
+                  ? h('span', { key: 'n', style: { fontSize: 10.5, color: C.low } },
+                    `✓ 识别到 ${editsCheck.lines} 条清单`)
+                  : editsCheck.empty
+                    ? h('span', { key: 'n', style: { fontSize: 10.5, color: C.subtle } }, '没贴内容')
+                    : h('span', { key: 'n', style: { fontSize: 10.5, color: C.high } },
+                      `✗ ${editsCheck.error}`),
+              ]),
+              showEdits ? h('div', { key: 'b', style: { marginTop: 6 } }, [
+                h('textarea', {
+                  key: 'ta', value: editsBox, rows: 6, spellCheck: false,
+                  placeholder: '{"pid":"p0003","text":"改写后的整段文字","op":"O1"}\n（一行一条；pid 必须是这篇文档里「可改写」的段号）',
+                  onChange: (e) => setEditsBox(e.target.value),
+                  style: {
+                    width: '100%', boxSizing: 'border-box', fontSize: 11, lineHeight: 1.6,
+                    fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
+                    padding: 8, borderRadius: 8, border: `1px solid ${C.border}`,
+                    background: 'transparent', color: 'inherit', resize: 'vertical',
+                  },
+                }),
+                (!editsCheck.ok && !editsCheck.empty) ? h('div', {
+                  key: 'bad',
+                  style: {
+                    marginTop: 5, padding: '6px 8px', borderRadius: 7, fontSize: 10.5,
+                    lineHeight: 1.7, color: C.dim, border: `1px solid ${C.high}`,
+                  },
+                }, editsCheck.hint) : null,
+                h('div', { key: 'b2', style: { display: 'flex', gap: 8, marginTop: 6, flexWrap: 'wrap' } }, [
+                  h(Btn, {
+                    key: 's', onClick: saveEditsToFile,
+                    primary: true,
+                    disabled: busy === 'saveEdits' || !editsCheck.ok || status?.docChanged || !canStageEdits,
+                    title: status?.docChanged
+                      ? '原文件已变化：先重新诊断'
+                      : '写进这篇文档的产物目录，同时解锁上方的「预检 / 回填并 AIGC 复检」',
+                  }, busy === 'saveEdits' ? '保存中…' : '保存并解锁上方按钮'),
+                  h(Btn, {
+                    key: 'l', onClick: runLintWithText,
+                    disabled: busy === 'lint' || !editsCheck.ok || status?.docChanged || !canStageEdits,
+                  }, busy === 'lint' ? '预检中…' : '用这段清单预检'),
+                  h(Btn, {
+                    key: 'a', onClick: runApplyWithText, primary: true,
+                    disabled: busy === 'apply' || !editsCheck.ok || status?.docChanged || !canStageEdits,
+                  }, busy === 'apply' ? '回填中…'
+                    : mode === 'dedupe' ? '用这段清单回填' : '用这段清单回填并 AIGC 复检'),
+                  h(Btn, {
+                    key: 'r', onClick: loadEditsFile, disabled: busy === 'loadEdits',
+                    title: '把当前文档目录里的 edits.jsonl 读进这个框',
+                  }, busy === 'loadEdits' ? '读取中…' : '读回已有清单'),
+                ]),
+                h('div', {
+                  key: 'tip', style: { fontSize: 10.5, color: C.subtle, lineHeight: 1.65, marginTop: 5 },
+                }, '这里只收清单（一行一条 JSON）。上面「改写指令」卡是发给模型的话术，别贴到这里。'
+                  + '保存后写入当前文档产物目录；编号全对不上时会被识别成别的文档清单并改名保留。'),
+              ]) : null,
+            ]),
           ]),
 
           // 预检结果
@@ -1644,15 +2258,41 @@ window.__ModuleLoader__.load({
             h('div', { key: 'h', style: sectionLabel }, '复检结论'),
             h('div', {
               key: 'line',
-              style: { fontSize: 12.5, color: verdict.passed ? C.low : C.high, marginBottom: 6 },
+              style: {
+                fontSize: 12.5, marginBottom: 6,
+                color: apply?.noop ? C.mid : verdict.passed ? C.low : C.high,
+              },
             }, verdict.passed
-              ? `通过 ｜ 改写 ${verdict.changed} 段 ｜ 字数 ${verdict.chars[0]}→${verdict.chars[1]}`
+              ? (apply?.noop
+                ? '格式/实体校验通过，但 0 段被改写 —— 没有任何实际改动'
+                : `通过 ｜ 改写 ${verdict.changed} 段 ｜ 字数 ${verdict.chars[0]}→${verdict.chars[1]}`)
               : `不通过 ｜ 已整篇回退（明细见报告）`),
             apply?.apply ? h('div', { key: 'cnt', style: { fontSize: 11.5, color: C.dim } },
               `接受 ${apply.apply.applied} ｜ 拒绝 ${apply.apply.rejected} ｜ 状态 ${apply.applyStatus}`) : null,
+            (apply?.reasonCounts && Object.keys(apply.reasonCounts).length) ? h('div', {
+              key: 'why', style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 5 },
+            }, [
+              h('span', { key: 'l', style: { fontSize: 11, color: C.dim, alignSelf: 'center' } }, '拒绝原因'),
+              ...Object.entries(apply.reasonCounts).map(([key, count]) => h('span', {
+                key,
+                style: {
+                  fontSize: 10.5, padding: '1px 7px', borderRadius: 999,
+                  background: C.pill, color: C.mid,
+                },
+              }, `${key}×${count}`)),
+            ]) : null,
             apply?.output ? h(PathChip, {
               key: 'out', label: '改稿', path: apply.output,
             }) : null,
+            currentVersion?.downloadable ? h('a', {
+              key: 'download-here',
+              href: api(`${PREFIX}/download?version=${encodeURIComponent(currentVersion.id)}`),
+              download: '',
+              style: {
+                display: 'inline-block', marginTop: 7, padding: '5px 10px', borderRadius: 7,
+                background: C.accent, color: '#fff', textDecoration: 'none', fontSize: 11.5,
+              },
+            }, `下载${currentVersionLabel}.docx`) : null,
           ]) : null,
 
           // 三栏对照
@@ -1703,9 +2343,13 @@ window.__ModuleLoader__.load({
                 : null,
               reduceCheckRes?.prob
                 ? {
-                  label: 'AIGC 概率',
-                  value: `${(100 * reduceCheckRes.prob.before).toFixed(1)}%→${(100 * reduceCheckRes.prob.after).toFixed(1)}%`,
+                  label: '正文 AI 疑似',
+                  value: `${(100 * reduceCheckRes.prob.before).toFixed(1)}%→${(100 * reduceCheckRes.prob.after).toFixed(1)}%`
+                    + `${reduceCheckRes.prob.afterBand ? ` · ${BAND_LABELS[reduceCheckRes.prob.afterBand] || '未判档'}` : ''}`
+                    + `${reduceCheckRes.prob.frozenBlocks ? ' · 冻结块' : ' · 未冻结'}`,
                   tone: reduceCheckRes.prob.mode !== 'model'
+                    || reduceCheckRes.prob.mixedMetric
+                    || !reduceCheckRes.prob.frozenBlocks
                     ? 'warn'
                     : reduceCheckRes.prob.after <= reduceCheckRes.prob.before ? 'ok' : 'bad',
                 }
@@ -1725,6 +2369,8 @@ window.__ModuleLoader__.load({
             onClose: () => setReport(null),
           }) : null,
 
+          mode !== 'dedupe' ? h(AigcDisclaimers, { key: 'aigc-disclaimer' }) : null,
+
           h('div', { key: 'foot', style: { display: 'flex', gap: 8 } }, [
             h(Btn, { key: 'f', onClick: refresh }, '刷新状态'),
           ]),
@@ -1733,7 +2379,7 @@ window.__ModuleLoader__.load({
         }, [
           h('div', { key: '1' }, '这个模式还没有诊断结果：回「← 模式」重新填路径并点「诊断」。'),
           h('div', { key: '2' },
-            '输出是篇内相对风险分（同篇内排序）与 9 维痕迹，不是任何平台的检测概率；本工具不承诺通过率。'),
+            '输出是篇内相对风险分、AI 疑似占比与 9 维痕迹，不是任何平台的检测结果；本工具不承诺通过率。'),
         ]) : null,
       ]);
     }
@@ -1761,8 +2407,9 @@ window.__ModuleLoader__.load({
     // 无浏览器环境下的渲染回归钩子（tools/render.mjs 用）
     if (typeof window !== 'undefined' && window.__PDR_TEST__) {
       plugin.__test = {
-        parseBlocks, renderInline, Markdown, shortPath, TopTable, AigcCard,
-        ModeHome, ReportCard, Panel, MODES, buildAigcReport,
+        parseBlocks, renderInline, Markdown, shortPath, TopTable, AigcCard, TargetTabs, VersionBar,
+        ModeHome, ReportCard, Panel, MODES, buildAigcReport, parseEditsText,
+        versionLabelForIndex, canStageEditsFor,
       };
     }
 
