@@ -17,10 +17,12 @@ selftest.py —— 离线自检：不下载模型也能验证核心逻辑
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 from typing import List, Sequence, Tuple
 
 import detector as D
 import diag as G
+import segscore as S
 
 
 class FakeTokenizer:
@@ -46,7 +48,6 @@ class FakeTokenizer:
 def make_detector(max_tokens=10, ai_index=1):
     det = D.Detector(model_id="fake", ai_index=ai_index, max_tokens=max_tokens)
     det.tokenizer = FakeTokenizer()
-    det.dry_run = False
     det._torch = None
     return det
 
@@ -127,12 +128,22 @@ def test_split_paragraphs_fallback():
 
 
 @case
-def test_dry_run_deterministic():
-    det = D.Detector(model_id="fake", dry_run=True).load()
+def test_real_path_is_deterministic():
+    det = make_detector(max_tokens=10)
+    det._probs_batch = lambda payloads: [(0.3, 0.7) for _ in payloads]
     a = det.score_document("测试文本内容" * 20)
     b = det.score_document("测试文本内容" * 20)
-    assert a.ai_prob == b.ai_prob, "dry-run 应可复现"
-    assert a.mode == "dry-run"
+    assert a.ai_prob == b.ai_prob, "同一输入的模型路径应可复现"
+    assert a.mode == "model"
+
+
+@case
+def test_segscore_is_char_weighted():
+    score = SimpleNamespace(segments=[
+        SimpleNamespace(chars=90, ai_prob=0.2),
+        SimpleNamespace(chars=10, ai_prob=0.8),
+    ])
+    assert abs(S.weighted_probability(score) - 0.26) < 1e-9
 
 
 @case

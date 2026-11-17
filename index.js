@@ -6,16 +6,18 @@
 // v0.2 变更：删除 GitHub 同步（/sync 与相关状态）；新增改写闭环
 //   /rewrite（生成任务）→ 模型写 edits.jsonl → /apply（预检+回填+复检）→ /compare（三栏对照）
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
-  existsSync, mkdirSync, readFileSync, writeFileSync,
+  copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, join, parse, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PREFIX = '/dsh-paper-dual';
-const VERSION = '0.4.6';
-const DEFAULT_ENGINE = 'E:\\ruanjianxiazai\\deepseek\\work\\paper-dual-reduce';
+const HERE = fileURLToPath(new URL('.', import.meta.url));
+const PKG = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+const VERSION = PKG.version || '0.0.0';
 
 // Cordis 要求显式声明要用的服务，否则 apply 里取 ctx.webServer 会报
 // "cannot get property webServer without inject"。
@@ -40,15 +42,37 @@ function saveState(patch) {
   return next;
 }
 
+function isEngineDir(dir) {
+  return Boolean(dir) && existsSync(join(dir, 'run.py'));
+}
+
 function engineDir() {
-  return loadState().engineDir || DEFAULT_ENGINE;
+  const configured = loadState().engineDir;
+  if (typeof configured === 'string' && configured.trim()) return resolve(configured.trim());
+
+  const candidates = [
+    process.env.PAPER_DUAL_ENGINE,
+    join(HERE, '..', 'paper-dual-reduce'),
+    join(process.cwd(), 'paper-dual-reduce'),
+    join(homedir(), 'paper-dual-reduce'),
+    join(homedir(), '.dsh', 'skills', 'paper-dual-reduce'),
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim() && isEngineDir(candidate)) {
+      return resolve(candidate.trim());
+    }
+  }
+  return process.env.PAPER_DUAL_ENGINE
+    ? resolve(process.env.PAPER_DUAL_ENGINE)
+    : join(homedir(), 'paper-dual-reduce');
 }
 
 // 用哪个 python：venv / conda / 系统解释器可能都不一样，而插件只认一个。
 // 优先级：设置里的 pythonPath > 环境变量 PAPER_DUAL_PYTHON > PATH 上的 python。
 function pythonBin() {
   const s = loadState();
-  return s.pythonPath || process.env.PAPER_DUAL_PYTHON || 'python';
+  const raw = s.pythonPath || process.env.PAPER_DUAL_PYTHON || 'python';
+  return String(raw).trim().replace(/^["']+|["']+$/g, '');
 }
 
 let pyExeCache;
@@ -60,9 +84,64 @@ async function pythonExecutable() {
   return pyExeCache;
 }
 
-function outdirOf() {
-  const run = loadState().lastRun;
-  return run?.outdir || join(engineDir(), 'out', 'plugin');
+function normalizeDocPath(raw) {
+  if (typeof raw !== 'string') return '';
+  let p = raw.trim().replace(/^["'“”]+|["'“”]+$/g, '').trim();
+  if (/^file:/i.test(p)) {
+    try { p = fileURLToPath(p); } catch { /* 保留原串，让后续存在性检查给出明确错误 */ }
+  }
+  return p ? resolve(p) : '';
+}
+
+function documentKey(docPath) {
+  return createHash('sha256')
+    .update(String(docPath).toLowerCase())
+    .digest('hex')
+    .slice(0, 10);
+}
+
+function outdirFor(docPath) {
+  const stem = (parse(docPath).name || 'paper')
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+    .replace(/\s+/g, '')
+    .slice(0, 36);
+  return join(stateDir(), 'docs', `${stem || 'paper'}-${documentKey(docPath)}`);
+}
+
+// 每次重新诊断都先写入 staging，成功后再替换正式目录。
+// 这样引擎失败时，上一次可用产物和 state.lastRun 仍然对得上。
+function prepareRunDir(docPath) {
+  const outdir = outdirFor(docPath);
+  const staging = join(stateDir(), 'staging', `${basename(outdir)}-${process.pid}-${Date.now()}`);
+  mkdirSync(staging, { recursive: true });
+  return { outdir, staging };
+}
+
+function discardRunDir(prepared) {
+  try {
+    const archive = join(stateDir(), 'archive');
+    mkdirSync(archive, { recursive: true });
+    renameSync(prepared.staging, join(archive, `failed-${basename(prepared.staging)}`));
+  } catch { /* 保留 staging 便于人工排查 */ }
+}
+
+function publishRunDir(prepared) {
+  const archive = join(stateDir(), 'archive');
+  mkdirSync(archive, { recursive: true });
+  mkdirSync(join(stateDir(), 'docs'), { recursive: true });
+  let backup = null;
+  if (existsSync(prepared.outdir)) {
+    backup = join(archive, `${basename(prepared.outdir)}-${Date.now()}`);
+    renameSync(prepared.outdir, backup);
+  }
+  try {
+    renameSync(prepared.staging, prepared.outdir);
+  } catch (e) {
+    if (backup && !existsSync(prepared.outdir)) {
+      try { renameSync(backup, prepared.outdir); } catch { /* 保留 archive 便于恢复 */ }
+    }
+    throw e;
+  }
 }
 
 function readText(p) {
@@ -73,6 +152,51 @@ function readJson(p) {
   const t = readText(p);
   if (t == null) return null;
   try { return JSON.parse(t); } catch { return null; }
+}
+
+function removeIfExists(p) {
+  try { unlinkSync(p); } catch { /* 文件不存在或正被占用 */ }
+}
+
+function archiveRunArtifacts(outdir, label) {
+  const names = [
+    'edits.jsonl',
+    'lint.json',
+    'rewritten.docx',
+    'rewritten.result.json',
+    'rewritten.verdict.json',
+    'report.md',
+  ];
+  const existing = names.map((name) => join(outdir, name)).filter((p) => existsSync(p));
+  if (!existing.length) return null;
+  const archive = join(stateDir(), 'archive', `${basename(outdir)}-${label}-${Date.now()}`);
+  mkdirSync(archive, { recursive: true });
+  const moved = [];
+  try {
+    for (const source of existing) {
+      const target = join(archive, basename(source));
+      renameSync(source, target);
+      moved.push([source, target]);
+    }
+  } catch (e) {
+    for (const [source, target] of moved.reverse()) {
+      try { renameSync(target, source); } catch { /* 保留 archive 中的副本路径便于排查 */ }
+    }
+    throw e;
+  }
+  return archive;
+}
+
+async function regenerateDiagnosticReport(run) {
+  const r = await runCmd(pythonBin(), [
+    'scripts/render_report.py',
+    '--doc', join(run.outdir, 'doc.json'),
+    '--profile', join(run.outdir, 'profile.json'),
+    '--out', join(run.outdir, 'report.md'),
+    '--mode', 'diagnose',
+    '--style', 'plain',
+  ], engineDir(), 120000);
+  return r.code === 0;
 }
 
 function clip(s, n) {
@@ -109,10 +233,25 @@ function runCmd(cmd, args, cwd, timeoutMs = 120000) {
     };
     let child;
     try {
+      const hfHome = modelCacheRoot();
+      const tempDir = join(hfHome, 'tmp');
+      mkdirSync(tempDir, { recursive: true });
       child = spawn(cmd, args, {
         cwd,
         windowsHide: true,
-        env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
+        env: {
+          ...process.env,
+          PYTHONUTF8: '1',
+          PYTHONIOENCODING: 'utf-8',
+          HF_HOME: hfHome,
+          HF_HUB_CACHE: join(hfHome, 'hub'),
+          HF_ENDPOINT: process.env.HF_ENDPOINT || 'https://hf-mirror.com',
+          HF_HUB_OFFLINE: modelWeightsCached() ? '1' : '0',
+          HF_HUB_DISABLE_XET: '1',
+          HF_HUB_DISABLE_PROGRESS_BARS: '1',
+          TEMP: tempDir,
+          TMP: tempDir,
+        },
       });
     } catch (e) {
       finish(-1, String(e?.message ?? e));
@@ -158,16 +297,6 @@ function summarize(doc, profile) {
   };
 }
 
-// 路径归一化：面板输入常带结尾空格、成对引号、file:// 前缀，
-// 这些都会让 existsSync 假阴性，报出「找不到文档」但文件其实在。
-function normalizeDocPath(raw) {
-  if (typeof raw !== 'string') return '';
-  let p = raw.trim();
-  p = p.replace(/^file:\/*/i, '');
-  p = p.replace(/^["'“”]+|["'“”]+$/g, '').trim();
-  return p;
-}
-
 async function diagnose(rawPath) {
   const dir = engineDir();
   const docPath = normalizeDocPath(rawPath);
@@ -180,9 +309,20 @@ async function diagnose(rawPath) {
   if (!/\.docx$/i.test(docPath)) {
     return { ok: false, error: '只支持 .docx（.doc 请先在 Word 里另存为 .docx）' };
   }
-  const outdir = join(dir, 'out', 'plugin');
-  const r = await runCmd(pythonBin(), ['run.py', 'diagnose', '--in', docPath, '--outdir', outdir], dir, 180000);
+  let prepared;
+  try {
+    prepared = prepareRunDir(docPath);
+  } catch (e) {
+    return { ok: false, error: `无法准备独立产物目录：${String(e?.message ?? e)}` };
+  }
+  const r = await runCmd(
+    pythonBin(),
+    ['run.py', 'diagnose', '--in', docPath, '--outdir', prepared.staging],
+    dir,
+    180000,
+  );
   if (r.code !== 0) {
+    discardRunDir(prepared);
     return {
       ok: false,
       error: clip(r.err || r.out || `引擎退出码 ${r.code}`, 600),
@@ -190,18 +330,39 @@ async function diagnose(rawPath) {
         ? 'python 不在 PATH，或引擎目录不对' : undefined,
     };
   }
-  const doc = readJson(join(outdir, 'doc.json'));
-  const profile = readJson(join(outdir, 'profile.json'));
-  if (!doc || !profile) return { ok: false, error: '引擎跑完了但没产出 doc.json / profile.json' };
+  const doc = readJson(join(prepared.staging, 'doc.json'));
+  const profile = readJson(join(prepared.staging, 'profile.json'));
+  if (!doc || !profile) {
+    discardRunDir(prepared);
+    return { ok: false, error: '引擎跑完了但没产出 doc.json / profile.json' };
+  }
+  try {
+    copyFileSync(docPath, join(prepared.staging, 'source.docx'));
+  } catch (e) {
+    discardRunDir(prepared);
+    return { ok: false, error: `无法保存原文档快照：${String(e?.message ?? e)}` };
+  }
+  try {
+    publishRunDir(prepared);
+  } catch (e) {
+    discardRunDir(prepared);
+    return { ok: false, error: `无法发布本次产物：${String(e?.message ?? e)}` };
+  }
+  const outdir = prepared.outdir;
 
   const summary = summarize(doc, profile);
   const at = new Date().toISOString();
   saveState({
-    lastRun: { docPath, outdir, at, title: basename(docPath), summary },
-    engineDir: dir,
+    lastRun: { key: documentKey(docPath), docPath, outdir, at, title: basename(docPath), summary },
     // 新文档 = 旧的改写产物作废
     lastTasks: null,
     lastApply: null,
+    lastReduce: null,
+    lastReduceCheck: null,
+    lastAigc: null,
+    loopRound: 0,
+    pacingBaseline: null,
+    pacingOrigin: null,
   });
   return { ok: true, at, docPath, outdir, summary, stdout: clip(r.out, 400) };
 }
@@ -232,19 +393,42 @@ function buildModelInstruction(outdir, docPath) {
   ].join('\n');
 }
 
+async function ensureDiagnosed(rawPath) {
+  const state = loadState();
+  const requested = normalizeDocPath(rawPath || state.lastRun?.docPath || '');
+  if (!requested) return { ok: false, error: '先诊断一次（或在面板里填路径），才有文档可改写' };
+  const same = state.lastRun
+    && String(state.lastRun.docPath).toLowerCase() === requested.toLowerCase()
+    && existsSync(state.lastRun.outdir);
+  if (same) return { ok: true, run: state.lastRun };
+
+  const diagnosed = await diagnose(requested);
+  if (!diagnosed.ok) return diagnosed;
+  return { ok: true, run: loadState().lastRun };
+}
+
 async function runRewrite(docPath) {
   const dir = engineDir();
-  const run = loadState().lastRun;
-  const doc = docPath || run?.docPath;
-  if (!doc) return { ok: false, error: '先诊断一次（或在面板里填路径），才有文档可改写' };
   if (!existsSync(join(dir, 'run.py'))) return { ok: false, error: `引擎目录里没有 run.py：${dir}` };
-  const outdir = run?.outdir || join(dir, 'out', 'plugin');
+  const ensured = await ensureDiagnosed(docPath);
+  if (!ensured.ok) return ensured;
+  const run = ensured.run;
+  const doc = run.docPath;
+  const outdir = run.outdir;
   const r = await runCmd(pythonBin(),
     ['run.py', 'rewrite', '--in', doc, '--outdir', outdir, '--style', 'plain'], dir, 180000);
   if (r.code !== 0) return { ok: false, error: clip(r.err || r.out, 700) };
 
   const tasks = readJson(join(outdir, 'tasks.json'));
   const promptsText = readText(join(outdir, 'prompts.jsonl')) ?? '';
+  if (!tasks) return { ok: false, error: `改写任务生成后缺少 tasks.json（引擎输出：${clip(r.out || r.err, 300)}）` };
+  let archived;
+  try {
+    archived = archiveRunArtifacts(outdir, 'new-tasks');
+  } catch (e) {
+    return { ok: false, error: `新任务已生成，但旧改稿/清单无法归档：${String(e?.message ?? e)}` };
+  }
+  const reportReady = await regenerateDiagnosticReport(run);
   const prompts = promptsText.split('\n').filter(Boolean).length;
   const at = new Date().toISOString();
   const payload = {
@@ -259,8 +443,17 @@ async function runRewrite(docPath) {
     belowThreshold: Boolean(tasks?.counts?.below_threshold),
     instruction: buildModelInstruction(outdir, doc),
     constraints: CONSTRAINTS,
+    reportReady,
   };
-  saveState({ lastTasks: payload });
+  saveState({
+    lastTasks: payload,
+    loopRound: 0,
+    lastApply: null,
+    lastReduce: null,
+    lastReduceCheck: null,
+    lastAigc: null,
+  });
+  if (archived) payload.archivedPrevious = archived;
   return { ok: true, ...payload, stdout: clip(r.out, 400) };
 }
 
@@ -270,10 +463,15 @@ async function runLint() {
   if (!run?.docPath) return { ok: false, error: '先诊断一次' };
   const edits = join(run.outdir, 'edits.jsonl');
   if (!existsSync(edits)) return { ok: false, error: `没有改写清单：${edits}（先让模型产出）` };
+  const lintPath = join(run.outdir, 'lint.json');
+  removeIfExists(lintPath);
   const r = await runCmd(pythonBin(),
     ['run.py', 'lint', '--in', run.docPath, '--outdir', run.outdir, '--edits', edits], dir, 120000);
-  const lint = readJson(join(run.outdir, 'lint.json'));
+  const lint = readJson(lintPath);
   if (!lint) return { ok: false, error: clip(r.err || r.out || '预检没有产出 lint.json', 600) };
+  if (r.code !== 0 && r.code !== 1) {
+    return { ok: false, error: clip(r.err || r.out || `预检异常退出（${r.code}）`, 600) };
+  }
   const rejected = (lint.items ?? []).filter((i) => i.status === 'would_reject').slice(0, 20);
   return { ok: true, counts: lint.counts, rejected, exitCode: r.code };
 }
@@ -298,15 +496,38 @@ async function runApply(body) {
     return { ok: false, error: `没有改写清单：${edits}（让模型先产出，或把 JSONL 传上来）` };
   }
 
+  const lintPath = join(run.outdir, 'lint.json');
+  const resultPath = join(run.outdir, 'rewritten.result.json');
+  const verdictPath = join(run.outdir, 'rewritten.verdict.json');
+  removeIfExists(lintPath);
+  removeIfExists(resultPath);
+  removeIfExists(verdictPath);
+  saveState({ lastApply: null });
+
   const lintRun = await runCmd(pythonBin(),
     ['run.py', 'lint', '--in', run.docPath, '--outdir', run.outdir, '--edits', edits], dir, 120000);
-  const lint = readJson(join(run.outdir, 'lint.json'));
+  const lint = readJson(lintPath);
+  if (!lint) {
+    return { ok: false, error: clip(lintRun.err || lintRun.out || '预检没有产出 lint.json', 700) };
+  }
+  if (lintRun.code !== 0 && lintRun.code !== 1) {
+    return { ok: false, error: clip(lintRun.err || lintRun.out || `预检异常退出（${lintRun.code}）`, 700) };
+  }
 
   const finRun = await runCmd(pythonBin(),
     ['run.py', 'finish', '--in', run.docPath, '--outdir', run.outdir, '--edits', edits,
       '--style', 'plain'], dir, 200000);
-  const verdict = readJson(join(run.outdir, 'rewritten.verdict.json'));
-  const result = readJson(join(run.outdir, 'rewritten.result.json'));
+  const verdict = readJson(verdictPath);
+  const result = readJson(resultPath);
+  if (![0, 3].includes(finRun.code)) {
+    return { ok: false, error: clip(finRun.err || finRun.out || `回填异常退出（${finRun.code}）`, 800) };
+  }
+  if (!verdict || !result) {
+    return {
+      ok: false,
+      error: clip(finRun.err || finRun.out || '回填结束但缺少 result / verdict 产物', 800),
+    };
+  }
 
   const at = new Date().toISOString();
   const payload = {
@@ -358,20 +579,45 @@ function buildCompare() {
 }
 
 // ---------------------------------------------------------------- AIGC 考官
-// 检测器（detector.py）需要 transformers+torch；缺依赖时用 --dry-run 打通结构，
-// 面板会显著标注「伪概率」。diag.py 是纯正则，无依赖，永远可用。
+// 检测器（detector.py）必须依赖 transformers+torch；缺依赖时停止打分并返回安装步骤。
+// diag.py 是纯正则，无依赖，永远可用。
 
-const HERE = fileURLToPath(new URL('.', import.meta.url));
 const AIGC_DIR = join(HERE, 'aigc');
 
-let detReadyCache;
+let detStateCache;
+
+async function detectorState() {
+  if (detStateCache !== undefined) return detStateCache;
+  await pythonExecutable();
+  const probe = [
+    'import json',
+    'out={"ready":True,"versions":{}}',
+    'for name in ("torch","transformers"):',
+    '    try:',
+    '        m=__import__(name)',
+    '        out["versions"][name]=str(getattr(m,"__version__","unknown"))',
+    '    except Exception as e:',
+    '        out["ready"]=False',
+    '        out["versions"][name]=None',
+    '        out["error"]=type(e).__name__+": "+str(e)',
+    'print(json.dumps(out,ensure_ascii=False))',
+  ].join('\n');
+  const r = await runCmd(pythonBin(), ['-c', probe], AIGC_DIR, 90000);
+  const line = r.out.trim().split(/\r?\n/).filter(Boolean).pop() || '';
+  try {
+    detStateCache = JSON.parse(line);
+  } catch {
+    detStateCache = {
+      ready: false,
+      versions: { torch: null, transformers: null },
+      error: clip(r.err || r.out || '无法检测 Python 依赖', 500),
+    };
+  }
+  return detStateCache;
+}
 
 async function detectorReady() {
-  if (detReadyCache !== undefined) return detReadyCache;
-  await pythonExecutable();
-  const r = await runCmd(pythonBin(), ['-c', 'import torch, transformers'], AIGC_DIR, 90000);
-  detReadyCache = r.code === 0;
-  return detReadyCache;
+  return Boolean((await detectorState()).ready);
 }
 
 function docTexts(p) {
@@ -382,7 +628,7 @@ function docTexts(p) {
   return { all: join(ps), rewritable: join(ps.filter((x) => !x.locked)) };
 }
 
-async function textFor(target) {
+async function docJsonFor(target) {
   const run = loadState().lastRun;
   if (!run?.outdir) return { ok: false, error: '先诊断一次' };
   if (target === 'rewritten') {
@@ -390,17 +636,24 @@ async function textFor(target) {
     if (!existsSync(docx)) return { ok: false, error: '还没有改稿：先做一次「回填并复检」' };
     const tmp = join(stateDir(), 'aigc-tmp');
     mkdirSync(tmp, { recursive: true });
-    const out = join(tmp, 'doc.json');
+    const out = join(tmp, `${run.key || documentKey(run.docPath)}-rewritten.json`);
     const r = await runCmd(pythonBin(),
       ['scripts/inspect_docx.py', '--in', docx, '--out', out], engineDir(), 120000);
     if (r.code !== 0) return { ok: false, error: clip(r.err || r.out, 400) };
     const texts = docTexts(out);
     if (!texts) return { ok: false, error: '改稿解析失败' };
-    return { ok: true, text: texts.all, rewritable: texts.rewritable };
+    return { ok: true, path: out, texts, run };
   }
-  const texts = docTexts(join(run.outdir, 'doc.json'));
+  const path = join(run.outdir, 'doc.json');
+  const texts = docTexts(path);
   if (!texts) return { ok: false, error: '缺 doc.json：重新诊断一次' };
-  return { ok: true, text: texts.all, rewritable: texts.rewritable };
+  return { ok: true, path, texts, run };
+}
+
+async function textFor(target) {
+  const d = await docJsonFor(target);
+  if (!d.ok) return d;
+  return { ok: true, text: d.texts.all, rewritable: d.texts.rewritable };
 }
 
 async function resolveAigcText(body) {
@@ -411,42 +664,91 @@ async function resolveAigcText(body) {
   return t.ok ? { ...t, target } : t;
 }
 
-// HuggingFace 默认缓存目录（Windows 也在 ~/.cache/huggingface/hub）。
-// 用户可能用 HF_HOME / HF_HUB_CACHE 改过，这里按同样优先级显示。
+function modelCacheRoot() {
+  const configured = loadState().hfCacheDir;
+  if (typeof configured === 'string' && configured.trim()) return configured.trim();
+  if (process.env.HF_HOME) return process.env.HF_HOME;
+  return join(stateDir(), 'hf-cache');
+}
+
 function hfCacheDir() {
-  const hub = process.env.HF_HUB_CACHE;
-  if (hub) return join(hub, 'models--yuchuantian--AIGC_detector_zhv3');
-  const home = process.env.HF_HOME;
-  if (home) return join(home, 'hub', 'models--yuchuantian--AIGC_detector_zhv3');
-  return join(homedir(), '.cache', 'huggingface', 'hub', 'models--yuchuantian--AIGC_detector_zhv3');
+  return join(modelCacheRoot(), 'hub', 'models--yuchuantian--AIGC_detector_zhv3');
+}
+
+function modelWeightsCached() {
+  const snapshots = join(hfCacheDir(), 'snapshots');
+  if (!existsSync(snapshots)) return false;
+  try {
+    return readdirSync(snapshots, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .some((entry) => (
+        existsSync(join(snapshots, entry.name, 'pytorch_model.bin'))
+        || existsSync(join(snapshots, entry.name, 'model.safetensors'))
+      ));
+  } catch {
+    return false;
+  }
+}
+
+function aigcSetup(det) {
+  const venv = 'E:\\paper-dual-aigc';
+  const configured = loadState();
+  const cache = configured.hfCacheDir || 'E:\\paper-dual-aigc\\hf-cache';
+  const python = configured.pythonPath || join(venv, 'Scripts', 'python.exe');
+  const installScript = [
+    `$Venv = "${venv}"`,
+    `$Cache = "${cache}"`,
+    '$env:HF_ENDPOINT = "https://hf-mirror.com"',
+    '$env:HF_HUB_DISABLE_XET = "1"',
+    'New-Item -ItemType Directory -Force -Path $Venv,$Cache | Out-Null',
+    'py -3.12 -m venv --upgrade-deps $Venv',
+    '& "$Venv\\Scripts\\python.exe" -m pip install --upgrade pip',
+    '& "$Venv\\Scripts\\python.exe" -m pip install torch==2.9.1 transformers==5.23.0 --index-url https://pypi.mirrors.ustc.edu.cn/simple/',
+    '& "$Venv\\Scripts\\python.exe" -c "import torch, transformers; print(torch.__version__, transformers.__version__)"',
+  ].join('\n');
+  return {
+    required: ['torch==2.9.1', 'transformers==5.23.0'],
+    missing: Object.entries(det?.versions ?? {})
+      .filter(([, version]) => !version)
+      .map(([name]) => name),
+    versions: det?.versions ?? {},
+    venv,
+    python,
+    modelCacheDir: cache,
+    hfHubCacheDir: join(cache, 'hub'),
+    installScript,
+    modelHint: '安装依赖并填写解释器/缓存路径后，点「校准」会联网下载约 409MB 的 pytorch_model.bin。',
+    modelUrl: 'https://huggingface.co/yuchuantian/AIGC_detector_zhv3',
+    notify: '未安装 transformers + torch，AIGC 概率不可用；插件不会生成或显示伪概率。',
+  };
+}
+
+function aigcMissing(det) {
+  return {
+    ok: false,
+    code: 'AIGC_DEPS_MISSING',
+    error: 'AIGC 真机依赖未安装：先按安装步骤装 torch + transformers，并把面板「python 解释器」指向该 venv。',
+    setup: aigcSetup(det),
+  };
 }
 
 async function aigcStatus() {
-  const ready = await detectorReady();
+  const detInfo = await detectorState();
+  const ready = Boolean(detInfo.ready);
   const py = await pythonExecutable();
-  const req = join(AIGC_DIR, 'requirements.txt');
-  const det = join(AIGC_DIR, 'detector.py');
   return {
     ok: true,
     diagReady: existsSync(join(AIGC_DIR, 'diag.py')),
     detectorReady: ready,
-    mode: ready ? 'model' : 'dry-run',
+    mode: ready ? 'model' : 'unavailable',
     model: 'yuchuantian/AIGC_detector_zhv3',
     python: py || pythonBin(),
     pythonIsCustom: Boolean(loadState().pythonPath),
+    versions: detInfo.versions ?? {},
     note: ready
-      ? '真机模式：transformers + torch 已装，分数是模型推理结果'
-      : 'dry-run 模式：未装 transformers + torch，分数是伪随机占位（结构一致，数值无意义）',
-    // 拿到「真分数」需要三步，缺一步都不算数
-    setup: {
-      step1Install: `"${pythonBin()}" -m pip install -r "${req}"`,
-      modelHint: '首次运行会从 HuggingFace 下载约 818MB 权重；国内可先设 HF_ENDPOINT=https://hf-mirror.com',
-      modelUrl: 'https://huggingface.co/yuchuantian/AIGC_detector_zhv3',
-      modelCacheDir: hfCacheDir(),
-      step3Calibrate: `"${pythonBin()}" "${det}" --calibrate`,
-      whyCalibrate: '该模型 config.json 缺 id2label，0/1 哪个是 AI 未知；不标定会得到反着读的分数且不报错',
-      pythonNote: '装依赖必须装进上面那个解释器，装到别的 venv 里插件仍然显示 dry-run',
-    },
+      ? '真机模式：torch + transformers 已就绪，分数是模型推理结果'
+      : '依赖未安装：不会显示 AIGC 概率，请按面板安装步骤配置',
+    setup: aigcSetup(detInfo),
   };
 }
 
@@ -469,7 +771,8 @@ async function aigcScore(body) {
   const t = await resolveAigcText(body);
   if (!t.ok) return t;
   if (!t.text.trim()) return { ok: false, error: '没有可打分的文本' };
-  const ready = await detectorReady();
+  const detInfo = await detectorState();
+  if (!detInfo.ready) return aigcMissing(detInfo);
   mkdirSync(stateDir(), { recursive: true });
   const file = join(stateDir(), `aigc-${t.target}.txt`);
   writeFileSync(file, t.text, 'utf8');
@@ -477,7 +780,6 @@ async function aigcScore(body) {
   const args = ['detector.py', '--file', file, '--json'];
   const st = loadState();
   if (Number.isInteger(st.aiLabel)) args.push('--ai-label', String(st.aiLabel));
-  if (!ready) args.push('--dry-run');
   const out = await runAigcJson(args, 300000);
   if (!out.ok) return { ok: false, error: out.error };
 
@@ -485,11 +787,43 @@ async function aigcScore(body) {
   const at = new Date().toISOString();
   saveState({
     lastAigc: {
-      at, target: t.target, mode: ready ? 'model' : 'dry-run',
+      at, target: t.target, mode: 'model',
       aiProb: result.ai_prob, chars: result.chars,
     },
+    ...(Number.isInteger(result.ai_index) && result.ai_index >= 0
+      ? { aiLabel: result.ai_index, calibratedAt: at }
+      : {}),
   });
-  return { ok: true, at, target: t.target, mode: ready ? 'model' : 'dry-run', result };
+  return { ok: true, at, target: t.target, mode: 'model', result };
+}
+
+async function aigcSegments(body) {
+  const target = body?.target === 'rewritten' ? 'rewritten' : 'original';
+  const d = await docJsonFor(target);
+  if (!d.ok) return d;
+  const detInfo = await detectorState();
+  if (!detInfo.ready) return aigcMissing(detInfo);
+  const outPath = join(d.run.outdir, `segscore-${target}.json`);
+  const args = [
+    join(AIGC_DIR, 'segscore.py'),
+    '--doc', d.path,
+    '--out', outPath,
+  ];
+  const st = loadState();
+  if (Number.isInteger(st.aiLabel)) args.push('--ai-label', String(st.aiLabel));
+  const r = await runCmd(pythonBin(), args, AIGC_DIR, 300000);
+  const result = readJson(outPath);
+  if (r.code !== 0 || !result) {
+    return { ok: false, error: clip(r.err || r.out || '逐段打分没有产出 segscore.json', 700) };
+  }
+  return {
+    ok: true,
+    at: new Date().toISOString(),
+    target,
+    mode: result.mode,
+    result,
+    outPath,
+  };
 }
 
 async function aigcDiag(body) {
@@ -528,15 +862,9 @@ async function aigcDiag(body) {
 // 标签方向标定：该模型 config.json 缺 id2label，0/1 谁代表 AI 未知。
 // 不标定直接跑会得到「反着读」的分数，而且不会报错——所以这一步是必须的。
 async function aigcCalibrate() {
-  const ready = await detectorReady();
-  if (!ready) {
-    return {
-      ok: false,
-      error: '未装 transformers + torch：先按三步装依赖再校准',
-      hint: 'dry-run 下校准没有意义（它直接返回 ai_index=1）',
-    };
-  }
-  const r = await runCmd(pythonBin(), ['detector.py', '--calibrate'], AIGC_DIR, 300000);
+  const detInfo = await detectorState();
+  if (!detInfo.ready) return aigcMissing(detInfo);
+  const r = await runCmd(pythonBin(), ['detector.py', '--calibrate'], AIGC_DIR, 900000);
   const text = `${r.out}`;
   const at = text.indexOf('{');
   let info = null;
@@ -614,6 +942,29 @@ function buildHints(diagResult) {
   return out;
 }
 
+const DIAG_DIMENSIONS = [
+  ['template', '模板套话'],
+  ['passive', '被动句'],
+  ['burstiness', '句长起伏'],
+  ['symmetry', '结构对称'],
+  ['nested', '层层嵌套'],
+  ['colon', '冒号列举'],
+  ['punct', '标点节奏'],
+  ['colloquial', '口语化'],
+  ['dash', '破折号'],
+];
+
+function activeDiagnosticRisks(d) {
+  const names = new Set();
+  for (const [key, label] of DIAG_DIMENSIONS) {
+    const item = d?.[key] ?? {};
+    if (item.risk || item.gate_failed || (key === 'burstiness' && item.level === 'low')) {
+      names.add(label);
+    }
+  }
+  return names;
+}
+
 async function reducePlan(body) {
   const scope = body?.scope === 'both' ? 'both' : 'aigc';
   const run = loadState().lastRun;
@@ -627,17 +978,11 @@ async function reducePlan(body) {
     hints.push('对篇内重复的片段做合并、回指或概括：同一内容只讲一遍，重复率不得上升');
     hints.push('合并不改变论点顺序与论据数量；不得为了消重删掉限定词');
   }
-  if (!hints.length) {
-    return {
-      ok: false,
-      error: '9 维诊断没有发现明显 AI 痕迹，这篇不需要「降 AI」改写',
-      diag: { riskCount: d.result.risk_count, riskScore: d.result.risk_score },
-    };
-  }
   const dir = engineDir();
+  const round = Math.max(1, Number(loadState().loopRound || 0) + 1);
+  const maxRounds = Math.min(Math.max(Number(body?.maxRounds) || 3, 1), 8);
   const hintsPath = join(run.outdir, scope === 'both' ? 'shuangjiang-hints.md' : 'aigc-hints.md');
   mkdirSync(run.outdir, { recursive: true });
-  writeFileSync(hintsPath, `${hints.map((h) => `· ${h}`).join('\n')}\n`, 'utf8');
 
   const fallbackTasks = scope === 'both' ? 16 : 12;
   const maxTasks = Math.min(Math.max(Number(body?.maxTasks) || fallbackTasks, 1), 30);
@@ -645,6 +990,10 @@ async function reducePlan(body) {
   // 逐段定位痕迹：只改「整篇统计过关」的段落是改不到指标的，
   // 必须把带具体痕迹的段落强制纳入本轮（plan.py --include）。
   let focus = [];
+  const pushFocus = (item) => {
+    if (!item?.pid || focus.some((x) => x.pid === item.pid)) return;
+    focus.push(item);
+  };
   try {
     const segPath = join(run.outdir, 'segdiag.json');
     const sg = await runCmd(pythonBin(), [
@@ -652,9 +1001,63 @@ async function reducePlan(body) {
     ], AIGC_DIR, 120000);
     if (sg.code === 0) {
       const seg = readJson(segPath);
-      focus = (seg?.paragraphs ?? []).slice(0, 8);
+      for (const item of (seg?.paragraphs ?? []).slice(0, 8)) {
+        pushFocus({ ...item, source: 'trace' });
+      }
     }
   } catch { /* 没有 segdiag 时就退回纯风险选段 */ }
+
+  // 真机考官逐段概率是最直接的下一轮选段依据。
+  let detectorBefore = null;
+  let detectorError = null;
+  if (body?.useDetector !== false && await detectorReady()) {
+    const ds = await aigcSegments({ target: 'original' });
+    if (ds.ok && ds.mode === 'model') {
+      detectorBefore = {
+        aiProb: ds.result.ai_prob,
+        threshold: ds.result.threshold,
+        top: ds.result.top ?? [],
+      };
+      for (const item of detectorBefore.top.slice(0, 8)) {
+        pushFocus({
+          pid: item.pid,
+          tags: ['aigc_high'],
+          risk_score: item.ai_prob,
+          ai_prob: item.ai_prob,
+          chars: item.chars,
+          source: 'detector',
+        });
+      }
+      if (detectorBefore.top.length) {
+        hints.push('优先重写 H 分段：它们由当前 AIGC 模型判为高概率，其他段落保持原意');
+      }
+    } else {
+      detectorError = ds.ok ? '逐段考官没有进入真机模式' : ds.error;
+    }
+  }
+
+  const explicitPids = Array.isArray(body?.focusPids)
+    ? body.focusPids
+      .map((pid) => String(pid).trim())
+      .filter((pid) => /^[A-Za-z0-9_-]{1,40}$/.test(pid))
+      .slice(0, 20)
+    : [];
+  for (const pid of explicitPids) {
+    pushFocus({ pid, tags: ['requested'], source: 'requested' });
+  }
+  if (!hints.length) {
+    if (!focus.length) {
+      return {
+        ok: false,
+        error: '9 维诊断与逐段 AIGC 考官都没有发现需要改写的段落',
+        diag: { riskCount: d.result.risk_count, riskScore: d.result.risk_score },
+        detectorError,
+      };
+    }
+    hints.push('只改被定向纳入的段落，其他段落保持原文，不改论据与结论');
+  }
+  writeFileSync(hintsPath, `${hints.map((h) => `· ${h}`).join('\n')}\n`, 'utf8');
+
   const includePids = focus.map((x) => x.pid);
 
   // 跨段编排：结构对称是跨段属性，给相邻段分配不同目标句数
@@ -689,12 +1092,22 @@ async function reducePlan(body) {
   if (r.code !== 0) return { ok: false, error: clip(r.err || r.out, 700) };
 
   const tasks = readJson(join(run.outdir, 'tasks.json'));
+  if (!tasks) return { ok: false, error: `降 AI 任务生成后缺少 tasks.json（引擎输出：${clip(r.out || r.err, 300)}）` };
+  let archived;
+  try {
+    archived = archiveRunArtifacts(run.outdir, scope === 'both' ? 'new-both-tasks' : 'new-aigc-tasks');
+  } catch (e) {
+    return { ok: false, error: `新任务已生成，但旧改稿/清单无法归档：${String(e?.message ?? e)}` };
+  }
+  const reportReady = await regenerateDiagnosticReport(run);
   const prompts = (readText(join(run.outdir, 'prompts.jsonl')) ?? '').split('\n').filter(Boolean).length;
   const opCount = {};
   for (const t of tasks?.tasks ?? []) opCount[t.op] = (opCount[t.op] ?? 0) + 1;
   const payload = {
     at: new Date().toISOString(),
     scope,
+    round,
+    maxRounds,
     outdir: run.outdir,
     hints,
     hintsPath,
@@ -702,7 +1115,11 @@ async function reducePlan(body) {
     prompts,
     opCount,
     focus,
+    detectorBefore,
+    detectorError,
     pacing: pacingInfo,
+    archivedPrevious: archived,
+    reportReady,
     promptsPath: join(run.outdir, 'prompts.jsonl'),
     editsPath: join(run.outdir, 'edits.jsonl'),
     diagBefore: {
@@ -720,7 +1137,14 @@ async function reducePlan(body) {
     ].join(''),
     stdout: clip(r.out, 300),
   };
-  saveState({ lastReduce: payload });
+  saveState({
+    lastReduce: payload,
+    loopRound: round,
+    lastTasks: null,
+    lastApply: null,
+    lastReduceCheck: null,
+    lastAigc: null,
+  });
   return { ok: true, ...payload };
 }
 
@@ -738,7 +1162,66 @@ async function pacingRuns(docPath) {
   } catch { return null; }
 }
 
-async function reduceCheck() {
+function snapshotAccepted(run) {
+  const rewritten = join(run.outdir, 'rewritten.docx');
+  if (!existsSync(rewritten)) return false;
+  copyFileSync(rewritten, join(run.outdir, 'accepted.docx'));
+  for (const name of ['rewritten.result.json', 'rewritten.verdict.json']) {
+    const source = join(run.outdir, name);
+    if (existsSync(source)) {
+      copyFileSync(source, join(run.outdir, `accepted.${name.replace('rewritten.', '')}`));
+    }
+  }
+  return true;
+}
+
+async function rollbackSemantic(run) {
+  const rejected = join(stateDir(), 'archive', `${basename(run.outdir)}-semantic-reject-${Date.now()}`);
+  mkdirSync(rejected, { recursive: true });
+  for (const name of [
+    'rewritten.docx',
+    'rewritten.result.json',
+    'rewritten.verdict.json',
+    'report.md',
+  ]) {
+    const source = join(run.outdir, name);
+    if (existsSync(source)) copyFileSync(source, join(rejected, name));
+  }
+
+  const accepted = join(run.outdir, 'accepted.docx');
+  const sourceSnapshot = join(run.outdir, 'source.docx');
+  const restoredFrom = existsSync(accepted)
+    ? accepted
+    : existsSync(sourceSnapshot) ? sourceSnapshot : run.docPath;
+  copyFileSync(restoredFrom, join(run.outdir, 'rewritten.docx'));
+  removeIfExists(join(run.outdir, 'rewritten.result.json'));
+  removeIfExists(join(run.outdir, 'rewritten.verdict.json'));
+  const reportReady = await regenerateDiagnosticReport(run);
+
+  const state = loadState();
+  const previous = state.lastApply ?? {};
+  saveState({
+    lastApply: {
+      ...previous,
+      semanticRolledBack: true,
+      semanticRollbackAt: new Date().toISOString(),
+      restoredFrom,
+      rejectedDir: rejected,
+      output: join(run.outdir, 'rewritten.docx'),
+      verdict: previous.verdict
+        ? { ...previous.verdict, passed: false, semanticSummary: '语义指标复检未通过，已回退' }
+        : null,
+    },
+  });
+  return {
+    performed: true,
+    restoredFrom,
+    rejectedDir: rejected,
+    reportReady,
+  };
+}
+
+async function reduceCheck(body) {
   const run = loadState().lastRun;
   if (!run?.docPath) return { ok: false, error: '先诊断一次' };
   if (!existsSync(join(run.outdir, 'rewritten.docx'))) {
@@ -753,6 +1236,7 @@ async function reduceCheck() {
 
   // 重复率复检：对改稿再跑一次引擎诊断，拿 profile 里的篇内重复率
   let dup = null;
+  let dupError = null;
   try {
     const chkDir = join(run.outdir, 'check');
     const rr = await runCmd(pythonBin(), [
@@ -768,13 +1252,22 @@ async function reduceCheck() {
           after: afterRate,
           delta: beforeRate == null ? null : Number((beforeRate - afterRate).toFixed(4)),
         };
+      } else {
+        dupError = '改稿诊断没有重复率字段';
       }
+    } else {
+      dupError = clip(rr.err || rr.out || `改稿诊断异常退出（${rr.code}）`, 200);
     }
-  } catch { /* 重复率复检失败不阻塞 AIGC 结论 */ }
+  } catch (e) {
+    dupError = clip(e?.message ?? e, 200);
+  }
 
   let prob = null;
-  const sb = await aigcScore({ target: 'original' });
-  const sa = await aigcScore({ target: 'rewritten' });
+  const modelRequired = body?.requireModel !== false;
+  const sb = modelRequired ? await aigcScore({ target: 'original' }) : { ok: false };
+  const sa = modelRequired ? await aigcScore({ target: 'rewritten' }) : { ok: false };
+  const modelRequested = modelRequired ? await detectorReady() : false;
+  const modelMissing = modelRequired && !modelRequested;
   if (sb.ok && sa.ok) {
     prob = {
       mode: sb.mode,
@@ -784,10 +1277,58 @@ async function reduceCheck() {
     };
   }
 
+  let detectorAfter = null;
+  if (prob?.mode === 'model') {
+    const seg = await aigcSegments({ target: 'rewritten' });
+    if (seg.ok) {
+      detectorAfter = {
+        aiProb: seg.result.ai_prob,
+        threshold: seg.result.threshold,
+        top: seg.result.top ?? [],
+        fallbackTop: (seg.result.paragraphs ?? [])
+          .filter((x) => !x.locked)
+          .slice()
+          .sort((x, y) => y.ai_prob - x.ai_prob)
+          .slice(0, 8),
+      };
+    }
+  }
+
+  const gateOk = after.gateRewritable === true;
+  const beforeRisks = activeDiagnosticRisks(b);
+  const afterRisks = activeDiagnosticRisks(a);
+  const newRisks = [...afterRisks].filter((name) => !beforeRisks.has(name));
+  const diagOk = Number(a.risk_score) <= Number(b.risk_score)
+    && Number(a.risk_count) <= Number(b.risk_count)
+    && newRisks.length === 0;
+  const dupOk = dup ? Number(dup.after) <= Number(dup.before) : null;
+  const probOk = prob?.mode === 'model' ? Number(prob.after) <= Number(prob.before) : null;
+  const probUnknown = modelRequested && !prob;
+  const failed = [
+    gateOk ? null : '语体门禁',
+    diagOk ? null : `9 维风险${newRisks.length ? `（新增：${newRisks.join('、')}）` : ''}`,
+    dupOk === false ? '篇内重复率' : null,
+    dupError ? `篇内重复率未复检：${dupError}` : null,
+    probOk === false ? 'AIGC 概率' : null,
+    probUnknown ? `AIGC 概率未复检：${clip(sb.error || sa.error || '考官失败', 160)}` : null,
+    modelMissing ? 'AIGC 真机依赖未安装' : null,
+    process.env.PAPER_DUAL_TEST_FORCE_ROLLBACK === '1' ? '测试注入失败' : null,
+  ].filter(Boolean);
+  const acceptance = {
+    accepted: failed.length === 0,
+    gate: gateOk,
+    diag: diagOk,
+    newRisks,
+    repeat: dupError ? false : dupOk,
+    probability: (probUnknown || modelMissing) ? false : probOk,
+    failed,
+  };
+
   // 对称串口径：origin=最初诊断，before=上一轮复检的值（本批基线），after=当前改稿。
   // 只报 origin→after 会让人以为每批都在拆同几条，所以两个差值都算出来。
   const originRuns = await pacingRuns(join(run.outdir, 'doc.json'));
-  const afterRuns = await pacingRuns(join(stateDir(), 'aigc-tmp', 'doc.json'));
+  const rewrittenDoc = await docJsonFor('rewritten');
+  const afterRuns = rewrittenDoc.ok ? await pacingRuns(rewrittenDoc.path) : null;
   const prevState = loadState();
   const baselineRuns = Number.isInteger(prevState.pacingBaseline)
     ? prevState.pacingBaseline
@@ -795,8 +1336,43 @@ async function reduceCheck() {
   const origin = Number.isInteger(prevState.pacingOrigin) ? prevState.pacingOrigin : originRuns;
   if (Number.isInteger(afterRuns)) saveState({ pacingBaseline: afterRuns, pacingOrigin: origin });
 
+  const round = Number(prevState.loopRound || 0);
+  const maxRounds = Number(prevState.lastReduce?.maxRounds || 3);
+  const focusPids = detectorAfter
+    ? (detectorAfter.top.length ? detectorAfter.top : detectorAfter.fallbackTop)
+      .slice(0, 8).map((x) => x.pid)
+    : [];
+  const nextRound = {
+    ready: prob?.mode === 'model',
+    canContinue: !acceptance.accepted && prob?.mode === 'model'
+      && round < maxRounds && focusPids.length > 0,
+    round,
+    nextRound: round < maxRounds ? round + 1 : null,
+    maxRounds,
+    reason: acceptance.failed,
+    focusPids,
+    detector: detectorAfter,
+  };
+
+  let acceptedSnapshot = false;
+  let rollback = null;
+  if (acceptance.accepted) {
+    try { acceptedSnapshot = snapshotAccepted(run); } catch { acceptedSnapshot = false; }
+  } else if (body?.autoRollback !== false) {
+    try {
+      rollback = await rollbackSemantic(run);
+    } catch (e) {
+      return {
+        ok: false,
+        error: `复检未通过，且自动回退失败：${clip(e?.message ?? e, 600)}`,
+        acceptance,
+      };
+    }
+  }
+
   const payload = {
     at: new Date().toISOString(),
+    round,
     pacing: {
       origin,
       before: baselineRuns,
@@ -818,7 +1394,13 @@ async function reduceCheck() {
       todoAfter: a.todo ?? [],
     },
     dup,
+    dupError,
     prob,
+    acceptance,
+    detectorAfter,
+    nextRound,
+    acceptedSnapshot,
+    rollback,
   };
   saveState({ lastReduceCheck: payload });
   return { ok: true, ...payload };
@@ -839,11 +1421,15 @@ function status() {
     lastRun: run,
     lastTasks: state.lastTasks ?? null,
     lastApply: state.lastApply ?? null,
+    lastReduce: state.lastReduce ?? null,
+    lastReduceCheck: state.lastReduceCheck ?? null,
+    loopRound: Number(state.loopRound || 0),
     hasEdits: existsSync(join(outdir, 'edits.jsonl')),
     compareCount: buildCompare().length,
     aigc: {
-      detectorReady: detReadyCache === true,
-      mode: detReadyCache === true ? 'model' : 'dry-run',
+      detectorReady: detStateCache?.ready === true,
+      mode: detStateCache?.ready === true ? 'model' : 'unknown',
+      versions: detStateCache?.versions ?? null,
       last: state.lastAigc ?? null,
       aiLabel: Number.isInteger(state.aiLabel) ? state.aiLabel : null,
       calibratedAt: state.calibratedAt ?? null,
@@ -878,6 +1464,10 @@ const handler = async (req, res) => {
       const body = await readBody(req);
       return sendJson(res, 200, await aigcScore(body));
     }
+    if (path === '/aigc/segments' && req.method === 'POST') {
+      const body = await readBody(req);
+      return sendJson(res, 200, await aigcSegments(body));
+    }
     if (path === '/aigc/diag' && req.method === 'POST') {
       const body = await readBody(req);
       return sendJson(res, 200, await aigcDiag(body));
@@ -896,7 +1486,8 @@ const handler = async (req, res) => {
       return sendJson(res, 200, await reducePlan(body));
     }
     if (path === '/reduce/check' && req.method === 'POST') {
-      return sendJson(res, 200, await reduceCheck());
+      const body = await readBody(req);
+      return sendJson(res, 200, await reduceCheck(body));
     }
     // 拖拽兜底：新版 Electron 不再暴露 File.path，只有文件名。
     // 前端把文件内容 base64 送来，这里落盘到 state 目录，返回真实绝对路径。
@@ -925,19 +1516,23 @@ const handler = async (req, res) => {
       const body = await readBody(req);
       const patch = {};
       if (typeof body.engineDir === 'string' && body.engineDir.trim()) {
-        patch.engineDir = body.engineDir.trim();
+        patch.engineDir = body.engineDir.trim().replace(/^["']+|["']+$/g, '');
       }
       if (typeof body.pythonPath === 'string') {
         // 空字符串 = 清空，回到 PATH 上的 python
         patch.pythonPath = body.pythonPath.trim();
         pyExeCache = undefined;
-        detReadyCache = undefined;
+        detStateCache = undefined;
+      }
+      if (typeof body.hfCacheDir === 'string') {
+        patch.hfCacheDir = body.hfCacheDir.trim();
       }
       const next = saveState(patch);
       return sendJson(res, 200, {
         ok: true,
-        engineDir: next.engineDir || DEFAULT_ENGINE,
+        engineDir: next.engineDir || engineDir(),
         pythonPath: next.pythonPath || '',
+        hfCacheDir: next.hfCacheDir || modelCacheRoot(),
       });
     }
     if (path === '/report') {
@@ -1008,6 +1603,7 @@ export function apply(ctx) {
     },
     output: toolOutput,
     timeoutMs: 200000,
+    isConcurrencySafe: () => false,
     async execute(args) {
       const r = await diagnose(String(args.path ?? ''));
       if (!r.ok) return { text: `诊断失败：${r.error}${r.hint ? `（${r.hint}）` : ''}` };
@@ -1038,6 +1634,7 @@ export function apply(ctx) {
     },
     output: toolOutput,
     timeoutMs: 200000,
+    isConcurrencySafe: () => false,
     async execute(args) {
       const r = await runRewrite(args?.path ? String(args.path) : '');
       if (!r.ok) return { text: `生成改写任务失败：${r.error}` };
@@ -1069,6 +1666,7 @@ export function apply(ctx) {
     },
     output: toolOutput,
     timeoutMs: 260000,
+    isConcurrencySafe: () => false,
     async execute(args) {
       const r = await runApply({ edits: args?.edits });
       if (!r.ok) return { text: `回填失败：${r.error}` };
@@ -1089,7 +1687,7 @@ export function apply(ctx) {
   ctx.tools.register({
     name: 'paper_dual_aigc',
     description: 'AIGC 考官：给当前论文（或改稿）打 AIGC 分并做 9 维 AI 痕迹诊断。'
-      + '缺 transformers/torch 时自动 dry-run（伪概率）并明确标注，不会假装是真分数。',
+      + '必须安装 transformers + torch；缺依赖时只返回安装步骤，不生成伪概率。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1102,13 +1700,24 @@ export function apply(ctx) {
       },
     },
     output: toolOutput,
-    timeoutMs: 320000,
+    timeoutMs: 900000,
+    isConcurrencySafe: () => false,
     async execute(args) {
       const target = args?.target === 'rewritten' ? 'rewritten' : 'original';
-      const st = await aigcStatus();
       const s = await aigcScore({ target });
-      if (!s.ok) return { text: `打分失败：${s.error}` };
+      if (!s.ok) {
+        return {
+          text: [
+            `打分失败：${s.error}`,
+            s.setup?.installScript ? 'PowerShell 安装步骤：' : '',
+            s.setup?.installScript || '',
+            s.setup?.python ? `安装后解释器：${s.setup.python}` : '',
+            s.setup?.modelCacheDir ? `模型缓存：${s.setup.modelCacheDir}` : '',
+          ].filter(Boolean).join('\n'),
+        };
+      }
       const d = await aigcDiag({ target });
+      const ps = await aigcSegments({ target });
       const r = s.result;
       const segsAll = r.segments ?? [];
       const segs = segsAll.slice()
@@ -1117,10 +1726,17 @@ export function apply(ctx) {
         .map((g) => `#${g.index} ${(100 * g.ai_prob).toFixed(0)}%`)
         .join(' · ');
       const lines = [
-        `AIGC 考官（${st.mode === 'model' ? '真机' : 'dry-run 伪概率'}）｜ ${target}`,
+        `AIGC 考官（真机）｜ ${target}`,
         `AI 概率 ${(100 * r.ai_prob).toFixed(1)}% ｜ ${r.chars} 字 ｜ ${segsAll.length} 段`,
         segs ? `最高分段：${segs}${segsAll.length > 8 ? ` …共 ${segsAll.length} 段` : ''}` : '',
       ];
+      if (ps.ok && ps.result.top?.length) {
+        lines.push(
+          `逐段定位：${ps.result.top.slice(0, 8).map((x) => (
+            `${x.pid} ${(100 * x.ai_prob).toFixed(0)}%`
+          )).join(' · ')}`,
+        );
+      }
       if (d.ok) {
         const dg = d.result;
         lines.push(
@@ -1129,9 +1745,6 @@ export function apply(ctx) {
         );
       } else {
         lines.push(`9 维诊断失败：${d.error}`);
-      }
-      if (st.mode !== 'model') {
-        lines.push('注意：该模式下的分数是占位值，不能用来判断改写效果。');
       }
       return { text: lines.filter(Boolean).join('\n') };
     },

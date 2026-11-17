@@ -94,7 +94,7 @@
 
 | 现成度 | 模型 | 下载量 | 协议 | 说明 |
 |---|---|---|---|---|
-| **A. 装上就能用** | `yuchuantian/AIGC_detector_zhv3` | **22.8k** | apache-2.0 | 中文首选。标准 `BertForSequenceClassification`（底座 `chinese-roberta-wwm-ext`），818 MB，512 token，覆盖 DeepSeek-V3 / GPT-4 / R1 类文本。`pipeline("text-classification")` 直接加载 |
+| **A. 装上就能用** | `yuchuantian/AIGC_detector_zhv3` | **22.8k** | apache-2.0 | 中文首选。标准 `BertForSequenceClassification`（底座 `chinese-roberta-wwm-ext`），约 409 MB，512 token，覆盖 DeepSeek-V3 / GPT-4 / R1 类文本。`pipeline("text-classification")` 直接加载 |
 | **A. 轻量版** | `krito2025/aigc-detector-zh-onnx` | 99 | 见仓库 | 上者的 ONNX 量化版，CPU 推理快数倍、不依赖 torch。下载量低，需自测与 FP32 版输出一致性 |
 | **B. 中文待验证** | `followsci/bert-ai-text-detector`（[Open-Detector](https://github.com/Imalwayshere/Open-Detector)） | 1.2k | MIT | 438 MB safetensors，140 万学术文本训练。**但 HF 元数据 `language: en`，中文效果需自测，不可默认可用** |
 | C. 论文索引 | [`Daisy-Zhang/Awesome-AIGC-Detection`](https://github.com/Daisy-Zhang/Awesome-AIGC-Detection) | — | — | 跟进新方法，非引擎 |

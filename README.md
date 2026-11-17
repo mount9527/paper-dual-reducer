@@ -15,7 +15,7 @@
 |---|---|---|
 | **降低篇内重复率** | 13 字指纹找「自己抄自己」 | 重复率前后对比（离线可验） |
 | **降低 AIGC 率** | 9 维痕迹诊断 → 写进提示词 → 改写 | 风险项/分数/语体门禁（离线可验）+ AIGC 概率（需模型） |
-| **双降** | 先降重（稳定结构）→ 再降 AIGC（打磨语体） | 两者都报告 |
+| **双降** | 一次改写同时注入消重与 AIGC 痕迹要求 | 两者分别报告 |
 
 每个模式内都是同一套按钮：生成改写任务 / 预检 / 回填并复检 / 三栏对照 / 查看报告。
 「降 AI」「双降」的任务按钮在各自卡片内（生成降 AI 任务 / 生成双降任务），生成后同样走
@@ -33,7 +33,7 @@
 
 | 步 | 动作 | 说明 |
 |---|---|---|
-| 1 | 生成改写任务 | 跑 `run.py rewrite`，出 `out/plugin/prompts.jsonl`；面板给出「贴给模型的指令」，可一键复制 |
+| 1 | 生成改写任务 | 跑 `run.py rewrite`，出当前文档产物目录里的 `prompts.jsonl`；面板给出可复制的模型指令 |
 | 2 | 模型改写 | 模型读 `prompts.jsonl`、写 `edits.jsonl`（一行一条 `{"pid","text","op"}`），**不碰 docx** |
 | 3 | 预检 / 回填复检 | 「预检」只跑闸门；「回填并复检」写 docx 并做篇级校验，不过就整篇回退 |
 | 4 | 三栏对照 | 原文 / 改文 / 字数与句数变化，逐段列出 |
@@ -43,20 +43,47 @@
 
 **AIGC 考官（v0.3 新增）**
 - 「打分」：对原文或改稿跑 AIGC 检测器，给出 AI 概率 + 分段概率条
+- 真机模式会把每个概率重新映射到 `pid`，用于定向纳入下一轮和高风险段落定位
 - 「9 维诊断」：模板套话 / 被动句 / 句长起伏 / 结构对称 / 层层嵌套 / 冒号列举 / 标点节奏 / 口语化 / 破折号，
   并输出**改写作业清单**（`todo`）
-- 「自检」：跑考官自带离线自检（11 项）
+- 「自检」：跑考官自带离线自检（13 项）
 
 **降 AIGC（v0.3.1 新增）**
 - 「生成降 AI 任务」：先跑 9 维诊断（离线可用），把结论翻译成改写要求，注入**每一条**提示词，
   再生成改写任务；模型改完回填后点「复检痕迹」
 - 「复检痕迹」：改写前后各跑一次 9 维诊断 + 检测器打分，给出风险项/分数/语门禁/概率的对比
+- 「自动回退」：任何离线/真机验收项恶化时，保留被拒改稿到 `archive/`，恢复上一版已验收
+  `accepted.docx`；若没有已验收版本则恢复原文
+- 「下一轮」：真机概率未下降时，从逐段分数中挑出高风险 `pid`，生成下一轮定向任务；
+  默认最多 3 轮，避免无限迭代
 - 完整方法与验收矩阵见 [`docs/design.md`](docs/design.md)（双降设计：降 AIGC 率 + 篇内重复率）
 
-> **真机 / dry-run**：检测器需要 `transformers + torch`（模型 `yuchuantian/AIGC_detector_zhv3`，约 818MB）。
-> 本机装不了包，所以面板会显著标注 **dry-run 伪概率**，并写明原因、缺点与三步切换路径。
-> 在能 `pip install -r aigc/requirements.txt` 的机器上，插件自动切到**真机**，分数才是模型推理结果。
-> `diag.py` 是纯正则，任何机器都可用。
+**AIGC 考官必须安装 `torch + transformers`。** 未安装时插件会停止打分并显示安装步骤，
+**不会生成或显示伪概率**。`diag.py` 的 9 维痕迹诊断仍是纯正则，可离线使用。
+
+Windows PowerShell 可直接复制执行（默认装到 E 盘；没有 E 盘时改前两行路径）：
+
+```powershell
+$Venv = "E:\paper-dual-aigc"
+$Cache = "E:\paper-dual-aigc\hf-cache"
+$env:HF_ENDPOINT = "https://hf-mirror.com"
+$env:HF_HUB_DISABLE_XET = "1"
+New-Item -ItemType Directory -Force -Path $Venv,$Cache | Out-Null
+py -3.12 -m venv --upgrade-deps $Venv
+& "$Venv\Scripts\python.exe" -m pip install --upgrade pip
+& "$Venv\Scripts\python.exe" -m pip install torch==2.9.1 transformers==5.23.0 --index-url https://pypi.mirrors.ustc.edu.cn/simple/
+& "$Venv\Scripts\python.exe" -c "import torch, transformers; print(torch.__version__, transformers.__version__)"
+```
+
+安装后在面板「设置」填写：
+
+- python 解释器：`E:\paper-dual-aigc\Scripts\python.exe`
+- AIGC 模型缓存：`E:\paper-dual-aigc\hf-cache`
+
+保存后点「校准」。首次会联网下载约 409MB 的 `pytorch_model.bin`，并自动完成 0/1 标签方向标定。
+
+状态与产物按文档路径哈希隔离在 `~/.dsh/paper-dual/docs/<文件名>-<哈希>/`。重新诊断同一路径时，
+上一批产物会移入 `~/.dsh/paper-dual/archive/`，不会把旧 `edits.jsonl` 当成新文档的改写清单。
 
 ## 给 agent 的工具
 
@@ -66,25 +93,28 @@
 | `paper_dual_diagnose` | 诊断一篇 .docx，返回风险分布与 Top 段落 |
 | `paper_dual_rewrite` | 为已诊断的论文生成改写任务与提示词 |
 | `paper_dual_apply_edits` | 写入 `edits.jsonl` → 预检 → 回填 → 篇级复检 |
-| `paper_dual_aigc` | AIGC 考官：对原文/改稿打分 + 9 维诊断（dry-run 会明确标注） |
+| `paper_dual_aigc` | AIGC 考官：全文概率 + 逐段 `pid` 定位 + 9 维诊断（缺依赖时只返回安装步骤） |
 
 ## 依赖
 
-- 引擎：`paper-dual-reduce` 仓库（含 `run.py`），默认
-  `E:\ruanjianxiazai\deepseek\work\paper-dual-reduce`，可在面板「设置」里改
+- 引擎：`paper-dual-reduce` 仓库（含 `run.py`）。优先用面板「设置」或环境变量
+  `PAPER_DUAL_ENGINE`，否则依次探测插件同级、当前目录、家目录以及
+  `~/.dsh/skills/paper-dual-reduce`
 - `python` 在 PATH；引擎零第三方依赖
-- 本插件不联网、不读 token、不写任何远端
+- 插件本身不读 token、不写任何远端。首次安装 Python 依赖或首次下载 AIGC 模型权重时，
+  `pip` / `transformers` / HuggingFace 会访问网络；模型权重不随本仓库分发
 
 ## 边界（别拿它当"过检测"用）
 
 - 风险分是**篇内相对指标**，只用于同篇排序，跨文档不可比，**不是任何平台的检测概率**
-- AIGC 考官给的是**单一开源模型**的概率，不等于知网/维普/格Z达的判定；dry-run 下更是占位值
+- AIGC 考官给的是**单一开源模型**的概率，不等于知网/维普/格Z达的判定
 - 不模拟任何平台，不承诺通过率
 - 标题、表格、代码块、公式、脚注、参考文献一律不改；不新增数字/引用/主观表述
 - 改稿必须由作者复核
 
-**复现边界**：本插件复现的是「检测 + 诊断 + 定向改写」，**没有**复现「自动迭代到分数下降」的闭环——
-那一步依赖真机分数，本机跑不了；接上真机后可以作为下一步。
+**复现边界**：本插件复现的是「检测 + 诊断 + 定向改写 + 分项验收 + 自动回退 + 下一轮任务」
+的辅助闭环。模型写文本这一步仍由 agent/用户完成，插件不替作者生成论文内容；真机概率和
+平台判定也不等同。
 
 ## 它相对笔灵做了什么、没做什么
 
@@ -104,13 +134,26 @@
 ```bash
 node --check index.js && node --check client.js
 node tools/smoke.mjs "<论文.docx>"      # 不起 DSH 也能验证宿主路由
-node tools/render.mjs                   # 报告渲染回归：块类型 / 表格 / 行内语法
+node tools/render.mjs "<report.md>"     # 报告渲染回归：块类型 / 表格 / 行内语法
 ```
+
+宿主状态与换文档回归：
+
+```powershell
+$env:PAPER_DUAL_ENGINE = "<paper-dual-reduce 目录>"
+$env:PAPER_DUAL_PYTHON = "E:\paper-dual-aigc\Scripts\python.exe"
+$env:HF_HOME = "E:\paper-dual-aigc\hf-cache"
+$env:HF_HUB_CACHE = "$env:HF_HOME\hub"
+node tools/regression.mjs "<论文一.docx>" "<论文二.docx>" "<edits.jsonl>"
+```
+
+它会验证：版本号一致、不同文档产物目录隔离、`rewrite` 传新路径会先诊断、
+真机模型打分、缺依赖时不产生伪分数、自动回退、下一轮定向任务和上传中文文件名。
 
 装进 profile / 热重载：
 
 ```
-plugin_manager install_bundle target="link:E:/ruanjianxiazai/deepseek/work/dsh-paper-dual"
+plugin_manager install_bundle target="link:<paper-dual-reducer 目录>"
 plugin_manager set_plugin target="include:dsh-paper-dual" enabled=false   # 再 true
 ```
 

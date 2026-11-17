@@ -28,7 +28,7 @@
 class Detector:
     def __init__(self, model_id: str = "yuchuantian/AIGC_detector_zhv3",
                  device: str = "cpu", ai_index: int | None = None,
-                 max_tokens: int = 510, dry_run: bool = False) -> None: ...
+                 max_tokens: int = 510) -> None: ...
 
     def load(self) -> "Detector": ...
     def calibrate(self, verbose: bool = False) -> dict: ...
@@ -46,7 +46,7 @@ class SegmentScore:
 class DocScore:
     ai_prob: float          # 全文分，字数加权，0~1
     chars: int; segments: list[SegmentScore]
-    ai_index: int; model: str; mode: str   # "model" | "dry-run"
+    ai_index: int; model: str; mode: str   # "model"
 ```
 
 **不变式**（由 `selftest.py` 守护，改动必须让自检仍然全绿）：
@@ -66,6 +66,16 @@ def diagnose(text: str) -> DiagResult
 `DiagResult` 关键字段：`risk_count`（触发维度数）、`risk_score`（模板句式双权）、`level`（high/mid/low）、`style_gate_passed`、`todo`（作业清单）。
 
 **注意**：`style_gate_passed == False` 表示语体被破坏，**不代表文本是 AI 写的**。这两个概念在代码里必须分开表达，不要合并成一个"AI 分数"。
+
+### 2.3 `segscore.py`
+
+读取论文引擎生成的 `doc.json`，保留原始 `pid`，逐段调用同一个 `Detector`，输出
+`paper-dual-reduce/segscore@1`：
+
+- `paragraphs[]` 与 `doc.json` 中非空段落同序
+- `top[]` 只保留未锁定且概率 ≥ 阈值的段落
+- 全文分 = 段落概率按字数加权
+- 只接受真机分数；不存在伪概率或 fallback 分数
 
 ---
 
@@ -274,7 +284,7 @@ trusted  = abs(gap) >= 0.15
 
 ```bash
 # 1. 自检全绿
-python selftest.py                       # exit 0，11/11
+python selftest.py                       # exit 0，13/13
 
 # 2. 标定可信
 python detector.py --calibrate           # trusted: true, gap >= 0.15
@@ -288,8 +298,8 @@ python diag.py --file samples/colloquial_bad.txt   # 语体门禁 FAIL，exit 1
 python diag.py --file samples/human_sample.txt     # 语体门禁 PASS，exit 0
 
 # 5. 闭环可复现（同一输入两次运行，输出一致）
-python detector.py --file samples/ai_sample.txt --dry-run --json | md5sum
-python detector.py --file samples/ai_sample.txt --dry-run --json | md5sum
+python detector.py --file samples/ai_sample.txt --json | md5sum
+python detector.py --file samples/ai_sample.txt --json | md5sum
 ```
 
 **P0 的业务验收**：对一篇真实论文，改写后

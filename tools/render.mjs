@@ -1,6 +1,6 @@
 // 渲染回归：不开浏览器，直接用真实 report.md 跑一遍 Markdown 渲染树。
 // 断言：块类型分布、表格是 table 元素、标题带层级、没有把管道符漏成文本。
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 const MINI = {
   createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
@@ -31,7 +31,11 @@ const { parseBlocks, renderInline, Markdown, TopTable, AigcCard } = mod.__test ?
 if (!parseBlocks || !renderInline || !Markdown || !TopTable || !AigcCard) throw new Error('测试钩子缺失');
 
 const reportPath = process.argv[2]
-  || 'E:/ruanjianxiazai/deepseek/work/paper-dual-reduce/out/plugin/report.md';
+  || process.env.PAPER_DUAL_REPORT
+  || '../paper-dual-reduce/out/e2e/report.md';
+if (!existsSync(reportPath)) {
+  throw new Error(`找不到 report.md：${reportPath}（传入路径或设置 PAPER_DUAL_REPORT）`);
+}
 const md = readFileSync(reportPath, 'utf8');
 
 const blocks = parseBlocks(md);
@@ -105,9 +109,9 @@ if (tableText.includes('%')) failures.push('风险分被误标成了百分比');
 
 // AIGC 考官卡：模式徽标、概率、9 维、作业清单都必须出现
 const aigcText = collectText(AigcCard({
-  status: { detectorReady: false, mode: 'dry-run', note: '未装依赖' },
+  status: { detectorReady: true, mode: 'model', note: '真机' },
   score: {
-    mode: 'dry-run',
+    mode: 'model',
     result: {
       ai_prob: 0.464, chars: 310,
       segments: [{ index: 0, chars: 103, ai_prob: 0.5072, preview: '随着数字化转型的不断深入' }],
@@ -131,8 +135,25 @@ const aigcText = collectText(AigcCard({
   target: 'original', onTarget: () => {}, onScore: () => {}, onDiag: () => {}, onSelftest: () => {},
   busy: '',
 })).join(' ');
-for (const need of ['AIGC 考官', 'dry-run 伪概率', '46.4%', '模板套话', '语体门禁（可改写段） 通过', '删除/改写句首模板']) {
+for (const need of ['AIGC 考官', '真机', '46.4%', '模板套话', '语体门禁（可改写段） 通过', '删除/改写句首模板']) {
   if (!aigcText.includes(need)) failures.push(`AIGC 卡缺少：${need}`);
+}
+
+const missingText = collectText(AigcCard({
+  status: {
+    detectorReady: false, mode: 'unavailable',
+    python: 'E:\\paper-dual-aigc\\Scripts\\python.exe',
+    setup: {
+      python: 'E:\\paper-dual-aigc\\Scripts\\python.exe',
+      modelCacheDir: 'E:\\paper-dual-aigc\\hf-cache',
+      installScript: 'pip install torch==2.9.1 transformers==5.23.0',
+    },
+  },
+  target: 'original', onTarget: () => {}, onScore: () => {}, onDiag: () => {},
+  onSelftest: () => {}, busy: '',
+})).join(' ');
+for (const need of ['依赖未安装', '已取消伪概率', 'pip install torch==2.9.1']) {
+  if (!missingText.includes(need)) failures.push(`缺依赖提示缺少：${need}`);
 }
 
 // 首页三选一与报告页：结构必须能渲染出来

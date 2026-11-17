@@ -14,14 +14,13 @@ detector.py —— 「考官」：中文 AIGC 文本检测器封装
 3. max_tokens = 510 而非 512 —— 给 [CLS] / [SEP] 留位置。
 4. 全文分 = 段落分按字数加权，不是段落算术平均 —— 否则短段落权重过高。
 
-依赖：transformers + torch（仅真实打分需要；--dry-run 不需要）
+依赖：transformers + torch
 模型权重许可：见对应 HuggingFace 页面（zhv3 为 apache-2.0）
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import sys
@@ -73,7 +72,7 @@ class DocScore:
     segments: List[SegmentScore]
     ai_index: int
     model: str
-    mode: str = "model"  # model | dry-run
+    mode: str = "model"
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -120,12 +119,10 @@ class Detector:
         device: str = "cpu",
         ai_index: Optional[int] = None,
         max_tokens: int = MAX_TOKENS,
-        dry_run: bool = False,
     ) -> None:
         self.model_id = model_id
         self.device = device
         self.max_tokens = max_tokens
-        self.dry_run = dry_run
         self.ai_index: Optional[int] = ai_index
         self.tokenizer = None
         self.model = None
@@ -135,9 +132,6 @@ class Detector:
     # ---- 加载 ----
 
     def load(self) -> "Detector":
-        if self.dry_run:
-            self.ai_index = 1 if self.ai_index is None else self.ai_index
-            return self
         try:
             import torch
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -151,7 +145,7 @@ class Detector:
         # 显式 num_labels=2：zhv3 的 config.json 缺 num_labels，不写会走默认值，
         # 虽然默认也是 2，但显式声明可在换模型时避免静默错配。
         self.model = AutoModelForSequenceClassification.from_pretrained(
-            self.model_id, num_labels=2
+            self.model_id, num_labels=2, use_safetensors=False
         )
         self.model.to(self.device)
         self.model.eval()
@@ -167,6 +161,23 @@ class Detector:
             if any(k in low for k in ("ai", "machine", "gpt", "generated", "fake")):
                 return int(idx)
         return None
+
+    def _build_inputs_with_special_tokens(self, ids: Sequence[int]) -> List[int]:
+        """兼容 transformers 4/5 的 tokenizer API 迁移。"""
+        ids = list(ids)
+        fn = getattr(self.tokenizer, "build_inputs_with_special_tokens", None)
+        if callable(fn):
+            return fn(ids)
+        cls_id = getattr(self.tokenizer, "cls_token_id", None)
+        sep_id = getattr(self.tokenizer, "sep_token_id", None)
+        if cls_id is not None and sep_id is not None:
+            return [cls_id] + ids + [sep_id]
+        prepare = getattr(self.tokenizer, "prepare_for_model", None)
+        if callable(prepare):
+            return prepare(ids, add_special_tokens=True)["input_ids"]
+        raise AttributeError(
+            f"{type(self.tokenizer).__name__} 无法为输入添加特殊 token"
+        )
 
     # ---- 前向 ----
 
@@ -184,12 +195,6 @@ class Detector:
             probs = self._torch.softmax(logits, dim=-1).tolist()
             out.extend((float(p[0]), float(p[1])) for p in probs)
         return out
-
-    def _dry_probs(self, text: str) -> Tuple[float, float]:
-        """dry-run 用的确定性伪概率，保证同一文本每次结果一致。"""
-        h = int(hashlib.sha256(text.encode("utf-8")).hexdigest()[:8], 16)
-        p1 = (h % 10000) / 10000.0
-        return 1.0 - p1, p1
 
     # ---- 窗口规划 ----
 
@@ -225,11 +230,6 @@ class Detector:
         if not text.strip():
             return 0.0, 0
 
-        if self.dry_run:
-            p0, p1 = self._dry_probs(text)
-            ai = (p0, p1)[self.ai_index or 0]
-            return ai, 1
-
         ids = self.tokenizer(text, add_special_tokens=False, truncation=False)["input_ids"]
         n = len(ids)
         if n == 0:
@@ -237,7 +237,7 @@ class Detector:
 
         wins = self._windows(n)
         payload = [
-            self.tokenizer.build_inputs_with_special_tokens(ids[s:e]) for s, e in wins
+            self._build_inputs_with_special_tokens(ids[s:e]) for s, e in wins
         ]
         raws = self._probs_batch(payload)
         p_ai = [r[self.ai_index or 0] for r in raws]
@@ -256,8 +256,7 @@ class Detector:
     def score_document(self, text: str) -> DocScore:
         paras = split_paragraphs(text)
         if not paras:
-            return DocScore(0.0, 0, [], self.ai_index or -1, self.model_id,
-                            "dry-run" if self.dry_run else "model")
+            return DocScore(0.0, 0, [], self.ai_index or -1, self.model_id, "model")
 
         segs: List[SegmentScore] = []
         for i, p in enumerate(paras):
@@ -280,7 +279,7 @@ class Detector:
             segments=segs,
             ai_index=self.ai_index if self.ai_index is not None else -1,
             model=self.model_id,
-            mode="dry-run" if self.dry_run else "model",
+            mode="model",
         )
 
     # ---- 标签方向标定 ----
@@ -291,22 +290,12 @@ class Detector:
         判据：比较 index=1 在两组探针上的均值，AI 组更高则 ai_index=1。
         若两组差异小于 0.15，判定为「不可信」，抛错要求人工指定 --ai-label。
         """
-        if self.dry_run:
-            self.ai_index = self.ai_index if self.ai_index is not None else 1
-            self.calibration = {
-                "method": "dry-run",
-                "ai_index": self.ai_index,
-                "gap": None,
-                "trusted": True,
-            }
-            return self.calibration
-
         if self.model is None:
             self.load()
 
         def mean_p1(texts: Sequence[str]) -> float:
             payload = [
-                self.tokenizer.build_inputs_with_special_tokens(
+                self._build_inputs_with_special_tokens(
                     self.tokenizer(t, add_special_tokens=False, truncation=True,
                                    max_length=self.max_tokens)["input_ids"]
                 )
@@ -383,8 +372,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         epilog="示例:\n"
         "  python detector.py --calibrate\n"
         "  python detector.py --file samples/ai_sample.txt\n"
-        "  python detector.py --text \"待检测文本\" --json\n"
-        "  python detector.py --file x.txt --dry-run   # 不加载模型，验证流程\n",
+        "  python detector.py --text \"待检测文本\" --json\n",
     )
     ap.add_argument("--file", help="待检测文本文件（UTF-8）")
     ap.add_argument("--text", help="直接传入文本")
@@ -394,12 +382,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--calibrate", action="store_true", help="只做标签方向标定")
     ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     ap.add_argument("--json", action="store_true", help="输出 JSON")
-    ap.add_argument("--dry-run", action="store_true", help="不加载模型，用伪概率跑通流程")
     args = ap.parse_args(argv)
 
     det = Detector(
         model_id=args.model, device=args.device, ai_index=args.ai_label,
-        dry_run=args.dry_run,
     )
     det.load()
 
