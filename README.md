@@ -12,31 +12,31 @@
 
 **1. 装 AIGC 依赖** —— 没有 `torch + transformers` 时面板不会假装有分数，只给安装命令和后续三步。
 
-![步骤 1：安装 AIGC 依赖](docs/images/step1-install-aigc.png)
+![步骤 1：安装 AIGC 依赖](https://raw.githubusercontent.com/mount9527/paper-dual-reducer/main/docs/images/step1-install-aigc.png)
 
 **2. 查看原文检测结果** —— 正文 AI 疑似占比、档位、三粒度稳定度，块级只列可改写正文。
 
-![步骤 2：查看原文检测结果](docs/images/step2-original-score.png)
+![步骤 2：查看原文检测结果](https://raw.githubusercontent.com/mount9527/paper-dual-reducer/main/docs/images/step2-original-score.png)
 
 **3. 基于原文生成改稿** —— 「基于原文生成改稿」先跑 9 维诊断，把结论写进每一批提示词。
 
-![步骤 3：基于原文生成改稿](docs/images/step3-generate-task.png)
+![步骤 3：基于原文生成改稿](https://raw.githubusercontent.com/mount9527/paper-dual-reducer/main/docs/images/step3-generate-task.png)
 
 **4. 复制整段指令** —— `prompts.jsonl` 里的任务可整段复制，交给模型改写。
 
-![步骤 4：复制整段指令](docs/images/step4-copy-prompt.png)
+![步骤 4：复制整段指令](https://raw.githubusercontent.com/mount9527/paper-dual-reducer/main/docs/images/step4-copy-prompt.png)
 
 **5. 发给任意 agent** —— 贴给任意对话式 agent，让它按 `{"pid","text","op"}` 输出 `edits.jsonl`。
 
-![步骤 5：把指令发给任意 agent](docs/images/step5-agent-rewrite.png)
+![步骤 5：把指令发给任意 agent](https://raw.githubusercontent.com/mount9527/paper-dual-reducer/main/docs/images/step5-agent-rewrite.png)
 
 **6. 贴回清单并保存** —— 清单贴回面板后实时校验、保存，再预检。
 
-![步骤 6：贴回清单并保存](docs/images/step6-paste-edits.png)
+![步骤 6：贴回清单并保存](https://raw.githubusercontent.com/mount9527/paper-dual-reducer/main/docs/images/step6-paste-edits.png)
 
 **7. 回填复检** —— 回填后自动做冻结块 AIGC 复检，恶化就整篇回退，不会悄悄留下更差的稿。
 
-![步骤 7：回填复检](docs/images/step7-apply-recheck.png)
+![步骤 7：回填复检](https://raw.githubusercontent.com/mount9527/paper-dual-reducer/main/docs/images/step7-apply-recheck.png)
 
 ## v0.8.0：冻结块比较、正文分账与强制 AIGC 复检
 
