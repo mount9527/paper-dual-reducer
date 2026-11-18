@@ -15,7 +15,7 @@
 plugin_manager install_bundle dsh-paper-dual
 
 # 2) 直接装 GitHub 的 tag（想用还没发到 npm 的改动时）
-plugin_manager install_bundle github:mount9527/paper-dual-reducer#v0.8.0
+plugin_manager install_bundle github:mount9527/paper-dual-reducer#v0.8.1
 
 # 3) 本地源码目录（改代码即时生效，开发时用）
 plugin_manager install_bundle target="link:/abs/path/to/dsh-paper-dual"
