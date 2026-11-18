@@ -59,9 +59,14 @@ plugin_manager install_bundle target="link:/abs/path/to/dsh-paper-dual"
 
 ![步骤 7：回填复检](https://raw.githubusercontent.com/mount9527/paper-dual-reducer/main/docs/images/step7-apply-recheck.png)
 
+## v0.8.2：文档同步
+
+- 只改文档：README 补「安装」一节（npm 包名 / GitHub tag / 本地 `link:` 三种方式），并把引擎指向改到公开仓库、补齐缺引擎时的报错特征；代码与 `0.8.1` 完全一致
+- 起因：0.8.1 发布时 README 里还没有安装命令，npm 页面读到的一直是旧说明，外部用户打开仓库找不到入手点
+
 ## v0.8.0：冻结块比较、正文分账与强制 AIGC 复检
 
-> **版本说明**：npm 上发布的是 `0.8.1`，代码与该 `0.8.0` 完全一致。`0.8.0` 在首次发布时撞上 npm 的暂存审核流程，版本号被占用后无法再次提交，因此只递增补丁号，功能无任何改动。
+> **版本说明**：`0.8.0` 在首次发布时撞上 npm 的暂存审核流程，版本号被占用后无法再次提交，因此 `0.8.1` 只递增了补丁号，功能无任何改动。
 
 - 原文首次评分时生成 `block-plan.json`；后续版本复用同一 `pid_span`、字符区间和块类型，避免重新切块造成分数抖动
 - 主指标改为「可改写正文 AI 疑似占比」，表格、参考文献/附录、锁定/排除区分别统计
