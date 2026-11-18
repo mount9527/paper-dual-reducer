@@ -5,13 +5,34 @@
   "type": "module",
   "license": "MIT",
   "author": "mount9527",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "aigc",
+    "plagiarism",
+    "academic-writing",
+    "de-ai",
+    "docx",
+    "chinese"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mount9527/paper-dual-reducer.git"
+  },
+  "homepage": "https://github.com/mount9527/paper-dual-reducer#readme",
+  "bugs": {
+    "url": "https://github.com/mount9527/paper-dual-reducer/issues"
+  },
   "engines": {
     "node": ">=20.0.0"
   },
   "icon": "icon.svg",
   "exports": {
     ".": "./index.js",
-    "./client": "./client.js"
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
   },
   "files": [
     "index.js",
@@ -27,6 +48,7 @@
     "aigc/requirements.txt",
     "aigc/samples/*.txt",
     "docs/design.md",
+    "docs/images/*.png",
     "README.md",
     "aigc/blocking.py",
     "aigc/bands.py",
