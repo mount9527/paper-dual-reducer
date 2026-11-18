@@ -6,6 +6,27 @@
 
 左栏点开「论文双降」，填一条中文论文 `.doc` / `.docx` 的绝对路径，点「诊断」——**只读**原文件，不改它。
 
+## 安装
+
+插件走 npm 分发，包名 `dsh-paper-dual`；**不需要下载安装包**，GitHub Releases 只放版本说明，不放附件。
+
+```bash
+# 1) 按包名装（推荐；DSH 会在 npm 官方源与 npmmirror 之间自动选响应快的）
+plugin_manager install_bundle dsh-paper-dual
+
+# 2) 直接装 GitHub 的 tag（想用还没发到 npm 的改动时）
+plugin_manager install_bundle github:mount9527/paper-dual-reducer#v0.8.0
+
+# 3) 本地源码目录（改代码即时生效，开发时用）
+plugin_manager install_bundle target="link:/abs/path/to/dsh-paper-dual"
+```
+
+装完重启客户端（Web 版整页刷新），侧栏出现「论文双降」即生效。命令行等价写法：
+`dsh plugin --profile web add -w dsh-paper-dual@0.8.1`。
+
+**只装插件跑不起来**：诊断、改写、预检、回填都要调引擎的 `run.py`，装完请在面板「设置」里
+把引擎目录配好，否则点「诊断」只会得到 `引擎目录里没有 run.py`。见下面「依赖」一节。
+
 ## 七步演示
 
 从装依赖到回填复检，真机跑一遍的完整链路（v0.8.0 截图；图中的论文路径与段落为演示样例）：
@@ -201,10 +222,19 @@ py -3.12 -m venv --upgrade-deps $Venv
 
 ## 依赖
 
-- 引擎：`paper-dual-reduce` 仓库（含 `run.py`）。优先用面板「设置」或环境变量
-  `PAPER_DUAL_ENGINE`，否则依次探测插件同级、当前目录、家目录以及
-  `~/.dsh/skills/paper-dual-reduce`
-- `python` 在 PATH；引擎零第三方依赖
+**引擎（必需）**：插件自身不解析 docx，`诊断 / 改写 / 预检 / 回填` 全部转去调引擎的 `run.py`。
+
+- 引擎目录里要有 `run.py`、`scripts/`、`lib/`。公开代码在
+  <https://github.com/mount9527/skill-paper-dual-reducer>（同一套 `run.py` + `scripts/*.py`，
+  子命令与产物和插件调用一一对应）
+- 三种指定方式，优先级从高到低：
+  1. 面板「设置 → 引擎目录」填绝对路径（保存后立刻生效）
+  2. 环境变量 `PAPER_DUAL_ENGINE`
+  3. 把引擎目录放到插件同级并命名为 `paper-dual-reduce`（自动探测顺序：插件同级 → 当前目录
+     → 家目录 → `~/.dsh/skills/paper-dual-reduce`）
+- 没配好时的表现：`诊断` / `预检` / `回填` 返回 `引擎目录里没有 run.py：<目录>`，并带
+  `needSetup: true`，面板据此提示去设置页
+- `python` 在 PATH（3.10+）；引擎零第三方依赖
 - 插件本身不读 token、不写任何远端。首次安装 Python 依赖或首次下载 AIGC 模型权重时，
   `pip` / `transformers` / HuggingFace 会访问网络；模型权重不随本仓库分发
 
