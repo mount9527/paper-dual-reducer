@@ -15,14 +15,14 @@
 plugin_manager install_bundle dsh-paper-dual
 
 # 2) 直接装 GitHub 的 tag（想用还没发到 npm 的改动时）
-plugin_manager install_bundle github:mount9527/paper-dual-reducer#v0.8.1
+plugin_manager install_bundle github:mount9527/paper-dual-reducer#v0.8.3
 
 # 3) 本地源码目录（改代码即时生效，开发时用）
 plugin_manager install_bundle target="link:/abs/path/to/dsh-paper-dual"
 ```
 
 装完重启客户端（Web 版整页刷新），侧栏出现「论文双降」即生效。命令行等价写法：
-`dsh plugin --profile web add -w dsh-paper-dual@0.8.1`。
+`dsh plugin --profile web add dsh-paper-dual@0.8.3`。
 
 **只装插件跑不起来**：诊断、改写、预检、回填都要调引擎的 `run.py`，装完请在面板「设置」里
 把引擎目录配好，否则点「诊断」只会得到 `引擎目录里没有 run.py`。见下面「依赖」一节。
@@ -58,6 +58,11 @@ plugin_manager install_bundle target="link:/abs/path/to/dsh-paper-dual"
 **7. 回填复检** —— 回填后自动做冻结块 AIGC 复检，恶化就整篇回退，不会悄悄留下更差的稿。
 
 ![步骤 7：回填复检](https://raw.githubusercontent.com/mount9527/paper-dual-reducer/main/docs/images/step7-apply-recheck.png)
+
+## v0.8.3：安装命令同步
+
+- 将 GitHub tag 与 DSH CLI 安装示例从 `0.8.1` 更新到当前版本，避免用户按旧文档安装
+- 仅修改发布文档与版本号，插件代码与 `0.8.2` 完全一致
 
 ## v0.8.2：文档同步
 
